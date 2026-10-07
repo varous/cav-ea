@@ -263,5 +263,91 @@ class TasksUnavailable(unittest.TestCase):
         self.assertEqual(state["coverage"]["tasks"]["code"], "TASKS_UNAVAILABLE")
 
 
+LEDGER_OWNERS = """| ID | Project / task | Owner | Deadline | Dependency |
+|---|---|---|---|---|
+| T-201 | Owner task | Alex Owner | 2026-10-05 | dep |
+| T-202 | Other person | PERSON_B | 2026-10-06 | dep |
+| T-203 | Co-owned | Alex Owner + PERSON_B | 2026-10-07 | dep |
+| T-204 | Team task | Audio Team | UNKNOWN | dep |
+| T-205 | Unassigned | NOT YET ASSIGNED | UNKNOWN | dep |
+### C-001 — x
+"""
+OWNER_NAME = "Alex Owner"
+OWNER_EMAIL = "alex@example.com"
+
+
+def owner_state():
+    return import_ledger(LEDGER_OWNERS)
+
+
+class OwnerFilter(unittest.TestCase):
+    def test_exact_match_only(self):
+        s = owner_state()
+        self.assertTrue(tasks.is_owner_task(s["tasks"]["T-201"], OWNER_NAME, OWNER_EMAIL))
+        self.assertFalse(tasks.is_owner_task(s["tasks"]["T-202"], OWNER_NAME, OWNER_EMAIL))
+        self.assertFalse(tasks.is_owner_task(s["tasks"]["T-203"], OWNER_NAME, OWNER_EMAIL))
+        self.assertFalse(tasks.is_owner_task(s["tasks"]["T-204"], OWNER_NAME, OWNER_EMAIL))
+        self.assertFalse(tasks.is_owner_task(s["tasks"]["T-205"], OWNER_NAME, OWNER_EMAIL))
+
+    def test_assignee_only_for_owner(self):
+        s = owner_state()
+        want = tasks.desired(s["tasks"]["T-201"], OWNER_EMAIL)
+        self.assertEqual(want["assignee"], OWNER_EMAIL)
+        self.assertIn("Assignee: " + OWNER_EMAIL, want["notes"])
+
+    def test_mirror_task_skips_non_owner(self):
+        s = owner_state()
+        session = Session()
+        self.assertIsNone(tasks.mirror_task(session, "list-1", s, "T-202", OWNER_NAME, OWNER_EMAIL))
+        self.assertEqual(session.calls, [])
+
+
+class Backfill(unittest.TestCase):
+    def test_creates_owner_tasks_once(self):
+        s = owner_state()
+        session = Session(list_items=[])
+        first = tasks.mirror_all(session, "list-1", s, OWNER_NAME, OWNER_EMAIL)
+        self.assertEqual([task_id for task_id, _ in first], ["T-201"])
+        creates = [c for c in session.calls if c[0] == "POST" and c[1].endswith("/tasks")]
+        self.assertEqual(len(creates), 1)
+        tasks.mirror_all(session, "list-1", s, OWNER_NAME, OWNER_EMAIL)
+        creates2 = [c for c in session.calls if c[0] == "POST" and c[1].endswith("/tasks")]
+        self.assertEqual(len(creates2), 1)
+        self.assertEqual(s["tasks"]["T-201"]["google_synced"]["assignee"], OWNER_EMAIL)
+
+    def test_patches_changed_and_skips_unchanged(self):
+        s = owner_state()
+        task = s["tasks"]["T-201"]
+        task["google_task_id"] = "gt-1"
+        task["google_synced"] = dict(tasks.desired(task, OWNER_EMAIL), updated="2026-10-01T00:00:00Z")
+        session = Session()
+        tasks.mirror_all(session, "list-1", s, OWNER_NAME, OWNER_EMAIL)
+        self.assertEqual([c for c in session.calls if c[0] in ("POST", "PATCH")], [])
+        task["title"] = "Owner task (renamed)"
+        session2 = Session()
+        tasks.mirror_all(session2, "list-1", s, OWNER_NAME, OWNER_EMAIL)
+        patches = [c for c in session2.calls if c[0] == "PATCH"]
+        self.assertEqual(patches[0][2], {"title": "Owner task (renamed)"})
+
+    def test_failure_does_not_raise(self):
+        class Failing(Session):
+            def post(self, url, json=None, timeout=None):
+                self.calls.append(("POST", url, json))
+                raise RuntimeError("TASKS_UNAVAILABLE")
+
+        s = owner_state()
+        results = tasks.mirror_all(Failing(list_items=[]), "list-1", s, OWNER_NAME, OWNER_EMAIL)
+        self.assertEqual(results, [("T-201", "error")])
+        self.assertEqual(s["tasks"]["T-201"]["tasks_sync_error"], "TASKS_UNAVAILABLE")
+
+    def test_assignee_is_not_sent_as_an_api_field(self):
+        s = owner_state()
+        session = Session(list_items=[])
+        tasks.mirror_all(session, "list-1", s, OWNER_NAME, OWNER_EMAIL)
+        body = [c[2] for c in session.calls if c[0] == "POST" and c[1].endswith("/tasks")][0]
+        self.assertNotIn("assignee", body)
+        self.assertIn("Assignee: " + OWNER_EMAIL, body["notes"])
+
+
 if __name__ == "__main__":
     unittest.main()

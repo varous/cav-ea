@@ -11,6 +11,7 @@ so a retry after a lost acknowledgement adopts the existing Google task instead
 of creating a duplicate.
 """
 import datetime as dt
+import json
 import re
 
 TASKS_SCOPE = "https://www.googleapis.com/auth/tasks"
@@ -75,26 +76,58 @@ def due_rfc3339(deadline):
     return f"{match.group(1)}-{match.group(2)}-{match.group(3)}T00:00:00.000Z"
 
 
-def notes_for(task):
+def is_owner_task(task, owner_name, owner_email):
+    """True only when the task's owner is exactly the owner name or owner email."""
+    owner = (task.get("owner") or "").strip()
+    candidates = {value.strip() for value in (owner_name, owner_email) if value and value.strip()}
+    return bool(owner) and owner in candidates
+
+
+def notes_for(task, owner_email=None):
+    parts = []
     base = (task.get("details") or "").strip()
-    tag = marker(task["id"])
-    return (base + "\n" if base else "") + tag
+    if base:
+        parts.append(base)
+    if owner_email:
+        parts.append("Assignee: " + owner_email)
+    parts.append(marker(task["id"]))
+    return "\n".join(parts)
 
 
-def desired(task):
-    """The Google Tasks fields the bot last intends to hold for this task."""
-    return {
+def desired(task, owner_email=None):
+    """The Google Tasks fields the bot last intends to hold for this task.
+
+    `assignee` is tracked for owner tasks only. The Tasks API exposes no writable
+    assignee field, so it is carried in the notes and in google_synced rather than
+    sent as an unknown (rejected) API field.
+    """
+    want = {
         "title": (task.get("title") or "").strip(),
         "status": "completed" if task.get("status") == "COMPLETED" else "needsAction",
         "due": due_rfc3339(task.get("deadline")),
-        "notes": notes_for(task),
+        "notes": notes_for(task, owner_email),
     }
+    if owner_email:
+        want["assignee"] = owner_email
+    return want
 
 
-def mirror_task(session, tasklist_id, state, task_id):
-    """Create or patch one operating task; record google_task_id + google_synced."""
+def _api_body(fields):
+    """Drop fields the Tasks API does not accept (e.g. assignee)."""
+    return {k: v for k, v in fields.items() if k != "assignee" and v is not None}
+
+
+def mirror_task(session, tasklist_id, state, task_id, owner_name=None, owner_email=None):
+    """Create or patch one operating task; record google_task_id + google_synced.
+
+    When owner_name is given, tasks whose owner is not the owner are skipped
+    (returns None, no API call).
+    """
     task = state["tasks"][task_id]
-    want = desired(task)
+    is_owner = owner_name is not None and is_owner_task(task, owner_name, owner_email)
+    if owner_name is not None and not is_owner:
+        return None
+    want = desired(task, owner_email if is_owner else None)
     synced = dict(task.get("google_synced") or {})
     google_task_id = task.get("google_task_id")
     created = False
@@ -103,13 +136,13 @@ def mirror_task(session, tasklist_id, state, task_id):
         if existing:
             google_task_id = existing["id"]
         else:
-            body = {k: v for k, v in want.items() if v is not None}
-            response = session.post(API + "/lists/" + tasklist_id + "/tasks", json=body, timeout=60)
+            response = session.post(API + "/lists/" + tasklist_id + "/tasks",
+                                    json=_api_body(want), timeout=60)
             response.raise_for_status()
             google_task_id = response.json()["id"]
             created = True
     if not created:
-        patch = {k: v for k, v in want.items() if synced.get(k) != v}
+        patch = {k: v for k, v in _api_body(want).items() if synced.get(k) != v}
         if patch:
             response = session.patch(API + "/lists/" + tasklist_id + "/tasks/" + google_task_id,
                                      json=patch, timeout=60)
@@ -117,6 +150,33 @@ def mirror_task(session, tasklist_id, state, task_id):
     task["google_task_id"] = google_task_id
     task["google_synced"] = dict(want, updated=now())
     return google_task_id
+
+
+def _error_code(error):
+    return str(error) if isinstance(error, RuntimeError) and str(error).isupper() else type(error).__name__
+
+
+def mirror_all(session, tasklist_id, state, owner_name, owner_email):
+    """Backfill every owner task to Google Tasks. Never raises.
+
+    Returns a list of (task_id, "synced"|"error"); per-task failures are recorded
+    as tasks_sync_error and retried next run.
+    """
+    results = []
+    for task_id, task in state["tasks"].items():
+        if not is_owner_task(task, owner_name, owner_email):
+            continue
+        try:
+            mirror_task(session, tasklist_id, state, task_id, owner_name, owner_email)
+            task.pop("tasks_sync_error", None)
+            results.append((task_id, "synced"))
+        except Exception as error:
+            code = _error_code(error)
+            task["tasks_sync_error"] = code
+            print(json.dumps({"status": "TASKS_SYNC_ERROR", "code": code, "task_id": task_id,
+                              "time": now()}), flush=True)
+            results.append((task_id, "error"))
+    return results
 
 
 # --- read-back (Tasks -> bot) -------------------------------------------------

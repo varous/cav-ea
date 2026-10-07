@@ -573,8 +573,18 @@ class Runtime:
             pass
     def mirror(self,state,task_id):
         """Best-effort one-way write to Google Tasks; callers guard failures."""
-        tasks_api.mirror_task(self.tasks,self.ensure_tasklist(),state,task_id)
-    def sync_tasks(self,state):
+        tasks_api.mirror_task(self.tasks,self.ensure_tasklist(),state,task_id,
+            self.settings['owner_name'],self.settings.get('owner_email'))
+    def backfill_tasks(self,state):
+        """One-way backfill of owner tasks; per-task failures recorded, never raised."""
+        tasklist_id=self.ensure_tasklist()
+        results=tasks_api.mirror_all(self.tasks,tasklist_id,state,
+            self.settings['owner_name'],self.settings.get('owner_email'))
+        errors=sum(1 for _,status in results if status=='error')
+        state.setdefault('coverage',{})['tasks_backfill']={'status':'SUCCESS' if not errors else 'PARTIAL',
+            'time':now(),'tasks':len(results),'synced':len(results)-errors,'errors':errors}
+        return state,results
+    def read_back_tasks(self,state):
         """Read-back: apply owner completion/reopen/edits from Google Tasks (loop-safe)."""
         tasklist_id=self.ensure_tasklist()
         changes=tasks_api.sync_from_tasks(self.tasks,tasklist_id,state,self.settings['owner_name'])
@@ -584,7 +594,11 @@ class Runtime:
                 self.mirror(state,c['task_id'])
         state.setdefault('coverage',{})['tasks']={'status':'SUCCESS','time':now(),'changes':len(changes)}
         return state
-    def intake_tasks(self,state): return self.sync_tasks(state)
+    def sync_tasks(self,state):
+        """Manual reconciliation: backfill owner tasks, then read back owner changes."""
+        state,_=self.backfill_tasks(state)
+        return self.read_back_tasks(state)
+    def intake_tasks(self,state): return self.read_back_tasks(state)
     @cached_property
     def bot(self):
         adc,_=google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
@@ -929,10 +943,24 @@ def model_status():
 
 @app.post('/admin/setup-tasks')
 def setup_tasks():
-    # Owner-only: create/reuse the dedicated Tasks list and store its id in config.
+    # Owner-only: create/reuse the dedicated Tasks list, then backfill owner tasks.
     runtime=Runtime()
-    tasklist_id=runtime.ensure_tasklist()
-    return jsonify(status='READY',tasklist_id=tasklist_id,assistant_name=runtime.settings['assistant_name'])
+    with runtime.store.locked():
+        runtime.guard_space()
+        state,generation=runtime.store.get('state.json')
+        if not state: raise RuntimeError('STATE_MIGRATION_REQUIRED')
+        tasklist_id=runtime.ensure_tasklist()
+        before=copy.deepcopy(state)
+        try:
+            state,results=runtime.backfill_tasks(state)
+        except Exception as e:
+            state=before; state.setdefault('coverage',{})['tasks_backfill']={'status':'ERROR','time':now(),'code':safe_code(e)}
+            runtime.store.save(state,generation)
+            return jsonify(status='ERROR',code=safe_code(e),tasklist_id=tasklist_id)
+        generation=runtime.store.save(state,generation)
+        errors=sum(1 for _,status in results if status=='error')
+        return jsonify(status='READY',tasklist_id=tasklist_id,tasks=len(results),errors=errors,
+            assistant_name=runtime.settings['assistant_name'])
 
 @app.post('/admin/sync-tasks')
 def sync_tasks_admin():
