@@ -144,22 +144,29 @@ class OwnerTaskNotRouted(unittest.TestCase):
         self.assertEqual(len(state["outbox"]), 1)
         self.assertIn("Ops", list(state["outbox"].values())[0]["text"])
 
-    def test_resolved_space_delivers_with_pill(self):
+    def test_resolved_candidate_is_asked_never_auto_delivered(self):
         r = self.runtime(PEOPLE)
         r.space_catalog = lambda: [{"space_id": "spaces/S1", "name": "Ops", "context": "ops"}]
         r.model_json = lambda s, u: {"space_id": "spaces/S1", "candidates": []}
-        r.member_user_id = lambda space, person: "555"
-        posted = {}
-        r.post_to_space = lambda space, text, mid, key: posted.update(space=space, text=text) or space + "/messages/M1"
         state = {"tasks": {"T-4": {"id": "T-4", "owner": "Joyjeet", "title": "Fix", "details": ""}}, "outbox": {}}
         r.route(state, "T-4")
         task = state["tasks"]["T-4"]
+        self.assertEqual(task["route_status"], "awaiting")   # always ask, no auto-delivery
+        self.assertEqual(len(state["outbox"]), 1)
+        self.assertIn("Which group should this task go to?", list(state["outbox"].values())[0]["text"])
+        r.route(state, "T-4")                                # idempotent: no duplicate ask
+        self.assertEqual(len(state["outbox"]), 1)
+        r.member_user_id = lambda space, person: "555"
+        posted = {}
+        r.post_to_space = lambda space, text, mid, key: posted.update(space=space, text=text) or space + "/messages/M1"
+        r.apply_route_reply(state, "1")                      # owner answers the number
         self.assertEqual(task["route_status"], "delivered")
         self.assertEqual(task["route_message_id"], "spaces/S1/messages/M1")
         self.assertTrue(posted["text"].startswith("<users/555> please claim this task:"))
 
     def test_owner_reply_resolves_awaiting_task(self):
         r = self.runtime(PEOPLE)
+        r.space_catalog = lambda: [{"space_id": "spaces/S1", "name": "Ops", "context": "ops"}]
         r.member_user_id = lambda space, person: "777"
         delivered = {}
         r.post_to_space = lambda space, text, mid, key: delivered.update(space=space) or space + "/messages/M2"
@@ -183,6 +190,97 @@ class RouteFailureIsolation(unittest.TestCase):
         applied = apply_changes(state, changes, "src", "Alex", None, boom)
         self.assertEqual(applied["tasks"]["T-101"]["owner"], "PERSON_B")
         self.assertEqual(applied["tasks"]["T-101"]["route_error"], "ROUTE_UNAVAILABLE")
+
+
+class SpaceMatching(unittest.TestCase):
+    CATALOG = [{"space_id": "S1", "name": "Ops Alpha"},
+               {"space_id": "S2", "name": "Ops Beta"},
+               {"space_id": "S3", "name": "Stage"}]
+
+    def test_number_maps_to_candidate(self):
+        self.assertEqual(routing.match_space("2", [{"space_id": "X"}, {"space_id": "Y"}], self.CATALOG),
+                         {"status": "matched", "space_id": "Y"})
+
+    def test_exact_name(self):
+        self.assertEqual(routing.match_space("stage", [], self.CATALOG), {"status": "matched", "space_id": "S3"})
+
+    def test_unique_substring(self):
+        self.assertEqual(routing.match_space("post it to stage please", [], self.CATALOG),
+                         {"status": "matched", "space_id": "S3"})
+
+    def test_ambiguous_substring(self):
+        self.assertEqual(routing.match_space("ops", [], self.CATALOG)["status"], "ambiguous")
+
+    def test_unknown(self):
+        self.assertEqual(routing.match_space("nowhere", [], self.CATALOG)["status"], "none")
+
+
+class AskFlow(unittest.TestCase):
+    def runtime(self):
+        from app import Runtime
+        r = object.__new__(Runtime)
+        r.settings = {"owner_name": "Alex Owner", "owner_email": "alex@example.com", "people": PEOPLE}
+        r.space = "spaces/ME"
+        r.owner = "users/1"
+        return r
+
+    def task(self, tid="T-9"):
+        return {"id": tid, "owner": "Joyjeet", "title": "Fix the thing", "details": ""}
+
+    def test_exact_name_question_when_no_candidates(self):
+        r = self.runtime()
+        r.space_catalog = lambda: []
+        r.model_json = lambda s, u: {"space_id": None, "candidates": []}
+        state = {"tasks": {"T-9": self.task()}, "outbox": {}}
+        r.route(state, "T-9")
+        self.assertIn("exact group name", list(state["outbox"].values())[0]["text"])
+
+    def test_numbered_list_question(self):
+        r = self.runtime()
+        r.space_catalog = lambda: [{"space_id": "S1", "name": "Stage", "context": ""}]
+        r.model_json = lambda s, u: {"space_id": "S1", "candidates": []}
+        state = {"tasks": {"T-9": self.task()}, "outbox": {}}
+        r.route(state, "T-9")
+        text = list(state["outbox"].values())[0]["text"]
+        self.assertIn("1. Stage", text)
+
+    def test_name_answer_resolves_and_delivers(self):
+        r = self.runtime()
+        r.space_catalog = lambda: [{"space_id": "spaces/S1", "name": "Stage", "context": ""}]
+        r.member_user_id = lambda space, person: "42"
+        r.post_to_space = lambda space, text, mid, key: space + "/messages/M9"
+        state = {"tasks": {"T-9": {**self.task(), "route_status": "awaiting", "route_candidates": []}}, "outbox": {}}
+        r.apply_route_reply(state, "put it in Stage")
+        self.assertEqual(state["tasks"]["T-9"]["route_status"], "delivered")
+        self.assertEqual(state["tasks"]["T-9"]["route_space_id"], "spaces/S1")
+
+    def test_ambiguous_reasks(self):
+        r = self.runtime()
+        catalog = [{"space_id": "S1", "name": "Ops Alpha", "context": ""},
+                   {"space_id": "S2", "name": "Ops Beta", "context": ""}]
+        r.space_catalog = lambda: catalog
+        state = {"tasks": {"T-9": {**self.task(), "route_status": "awaiting", "route_candidates": []}}, "outbox": {}}
+        r.apply_route_reply(state, "ops")
+        self.assertEqual(state["tasks"]["T-9"]["route_status"], "awaiting")
+        self.assertEqual(state["tasks"]["T-9"]["route_ask_count"], 1)
+        self.assertEqual(len(state["outbox"]), 1)
+
+    def test_unknown_reasks(self):
+        r = self.runtime()
+        r.space_catalog = lambda: [{"space_id": "S1", "name": "Ops", "context": ""}]
+        state = {"tasks": {"T-9": {**self.task(), "route_status": "awaiting", "route_candidates": []}}, "outbox": {}}
+        r.apply_route_reply(state, "nowhere at all")
+        self.assertEqual(state["tasks"]["T-9"]["route_ask_count"], 1)
+        self.assertIn("exact group name", list(state["outbox"].values())[0]["text"])
+
+    def test_member_not_found_notifies_owner(self):
+        r = self.runtime()
+        r.space_catalog = lambda: [{"space_id": "spaces/S1", "name": "Stage", "context": ""}]
+        r.member_user_id = lambda space, person: None
+        state = {"tasks": {"T-9": {**self.task(), "route_status": "awaiting", "route_candidates": []}}, "outbox": {}}
+        r.apply_route_reply(state, "Stage")
+        self.assertEqual(state["tasks"]["T-9"]["route_status"], "unresolved_member")
+        self.assertIn("couldn't find", list(state["outbox"].values())[0]["text"])
 
 
 if __name__ == "__main__":

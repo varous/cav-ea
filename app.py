@@ -627,29 +627,40 @@ class Runtime:
         if not receipt.get('name','').startswith(space_id+'/messages/'):
             raise RuntimeError('ROUTE_RECEIPT_MISMATCH')
         return receipt['name']
-    def ask_route_space(self,state,task,candidates):
-        if not candidates: return
-        lines=['Which space should this task go to? ('+task['id']+' — '+(task.get('title') or '')+')']
-        for index,candidate in enumerate(candidates,1):
-            lines.append(f"{index}. {candidate.get('name') or candidate['space_id']}")
-        add_outbox(state,self.space,'route-ask:'+task['id'],'\n'.join(lines))
-    def deliver_route(self,state,task,person,space_ids):
-        # Choose the first candidate space the person actually belongs to.
-        for space_id in space_ids:
-            user_id=self.member_user_id(space_id,person)
-            if not user_id: continue
-            message_id='client-cw-route-'+digest(task['id'])[:40]
-            receipt=self.post_to_space(space_id,routing.delivery_text(user_id,task),message_id,'route:'+task['id'])
-            task['route_space_id']=space_id; task['route_message_id']=receipt
-            task['route_status']='delivered'; task['route_delivered']=now(); task.pop('route_error',None)
-            return True
-        task['route_status']='unresolved_member'; task['route_error']='MEMBER_NOT_FOUND'; return False
+    def ask_route_space(self,state,task,candidates,reason='initial'):
+        """Always ask the owner which group; never silent."""
+        header='Which group should this task go to? ('+task['id']+' — '+(task.get('title') or '')+')'
+        if candidates:
+            lines=[header]
+            for index,candidate in enumerate(candidates,1):
+                lines.append(f"{index}. {candidate.get('name') or candidate['space_id']}")
+        else:
+            lines=[header+' — reply with the exact group name.']
+        add_outbox(state,self.space,'route-ask:'+task['id']+':'+reason+':'+str(task.get('route_ask_count',0)),'\n'.join(lines))
+    def notify_owner(self,state,task,text):
+        add_outbox(state,self.space,'route-notice:'+task['id']+':'+str(task.get('route_notice_count',0)),text)
+        task['route_notice_count']=task.get('route_notice_count',0)+1
+    def deliver_route(self,state,task,person,space_id):
+        """Post the pill task message in the chosen space; never silent on failure."""
+        user_id=self.member_user_id(space_id,person)
+        if not user_id:
+            task['route_status']='unresolved_member'; task['route_space_id']=space_id
+            task['route_error']='MEMBER_NOT_FOUND'
+            who=person.get('display_name') or task.get('owner') or 'that person'
+            self.notify_owner(state,task,"I couldn't find "+str(who)+" in that space ("+task['id']
+                              +"). Reassign the task or pick another group.")
+            return False
+        message_id='client-cw-route-'+digest(task['id'])[:40]
+        receipt=self.post_to_space(space_id,routing.delivery_text(user_id,task),message_id,'route:'+task['id'])
+        task['route_space_id']=space_id; task['route_message_id']=receipt
+        task['route_status']='delivered'; task['route_delivered']=now(); task.pop('route_error',None)
+        return True
     def route(self,state,task_id):
-        """Route a non-owner task to its Chat space; never raises through apply_changes."""
+        """ALWAYS ask the owner which group for a non-owner single-person task."""
         task=state['tasks'].get(task_id)
         if not task or not self.people: return
         if tasks_api.is_owner_task(task,self.settings['owner_name'],self.settings.get('owner_email')): return
-        if task.get('route_status')=='delivered': return
+        if task.get('route_status') in ('awaiting','delivered'): return
         resolved=routing.resolve_person(self.people,task.get('owner'))
         if resolved=='AMBIGUOUS':
             task['route_status']='unresolved_person'; task['route_error']='OWNER_AMBIGUOUS'; return
@@ -659,29 +670,35 @@ class Runtime:
         task['route_target']=canonical
         catalog=self.space_catalog()
         names={entry['space_id']:entry['name'] for entry in catalog}
-        space_id,candidates=routing.resolve_space(self.model_json,task,catalog)
-        candidates=[{**c,'name':names.get(c['space_id'],'')} for c in candidates]
-        if not space_id:
-            task['route_status']='awaiting'; task['route_candidates']=candidates
-            self.ask_route_space(state,task,candidates); return
-        self.deliver_route(state,task,person,[space_id]+[c['space_id'] for c in candidates])
-    def pick_space(self,text,candidates):
-        normalized=routing.normalize(text)
-        for index,candidate in enumerate(candidates or [],1):
-            if normalized==str(index): return candidate['space_id']
-        for candidate in candidates or []:
-            name=routing.normalize(candidate.get('name'))
-            if name and name in normalized: return candidate['space_id']
-        return None
+        best,candidates=routing.resolve_space(self.model_json,task,catalog)
+        entries=[]
+        if best in names:
+            entries.append({'space_id':best,'name':names[best],'reason':''})
+        for candidate in candidates:
+            if all(entry['space_id']!=candidate['space_id'] for entry in entries):
+                entries.append({'space_id':candidate['space_id'],'name':names.get(candidate['space_id'],''),
+                                'reason':candidate.get('reason','')})
+        task['route_status']='awaiting'; task['route_candidates']=entries[:3]
+        task['route_ask_count']=task.get('route_ask_count',0)
+        self.ask_route_space(state,task,task['route_candidates'])
     def apply_route_reply(self,state,text):
-        """Owner named a candidate space: deliver the deferred tasks it matches."""
-        for task in [t for t in state['tasks'].values() if t.get('route_status')=='awaiting']:
-            space_id=self.pick_space(text,task.get('route_candidates'))
-            if not space_id: continue
-            resolved=routing.resolve_person(self.people,task.get('owner'))
-            if not resolved or resolved=='AMBIGUOUS': continue
-            _,person=resolved
-            self.deliver_route(state,task,person,[space_id])
+        """Resolve the owner's group answer against the full catalog, then deliver."""
+        awaiting=[t for t in state['tasks'].values() if t.get('route_status')=='awaiting']
+        if not awaiting or not text: return
+        catalog=self.space_catalog()
+        for task in awaiting:
+            result=routing.match_space(text,task.get('route_candidates') or [],catalog)
+            if result['status']=='matched':
+                resolved=routing.resolve_person(self.people,task.get('owner'))
+                if not resolved or resolved=='AMBIGUOUS': continue
+                _,person=resolved
+                self.deliver_route(state,task,person,result['space_id'])
+            else:
+                task['route_ask_count']=task.get('route_ask_count',0)+1
+                if result['status']=='ambiguous':
+                    self.ask_route_space(state,task,result['matches'],reason='ambiguous')
+                else:
+                    self.ask_route_space(state,task,None,reason='notfound')
     def route_pending(self,state):
         for task_id,task in list(state['tasks'].items()):
             if task.get('route_status') in ('delivered','awaiting'): continue

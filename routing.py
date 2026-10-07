@@ -103,6 +103,35 @@ def member_user_id(members, person):
     return found[0] if len(found) == 1 else None
 
 
+def match_space(text, candidates, catalog):
+    """Resolve the owner's answer to a space id.
+
+    Returns {"status": "matched", "space_id"} | {"status": "ambiguous", "matches": [...]}
+    | {"status": "none"}. Numbers map to the candidate list; otherwise the full
+    catalog is matched by exact name, then by unique substring.
+    """
+    normalized = normalize(text)
+    if not normalized:
+        return {"status": "none"}
+    for index, candidate in enumerate(candidates or [], 1):
+        if normalized == str(index):
+            return {"status": "matched", "space_id": candidate["space_id"]}
+    exact = [entry for entry in (catalog or []) if normalize(entry["name"]) == normalized]
+    if len(exact) == 1:
+        return {"status": "matched", "space_id": exact[0]["space_id"]}
+    if len(exact) > 1:
+        return {"status": "ambiguous", "matches": exact[:3]}
+    partial = [entry for entry in (catalog or [])
+               if normalize(entry["name"]) and (normalize(entry["name"]) in normalized
+                                                or normalized in normalize(entry["name"]))]
+    deduped = list({entry["space_id"]: entry for entry in partial}.values())
+    if len(deduped) == 1:
+        return {"status": "matched", "space_id": deduped[0]["space_id"]}
+    if len(deduped) > 1:
+        return {"status": "ambiguous", "matches": deduped[:3]}
+    return {"status": "none"}
+
+
 SPACE_SYSTEM = (
     "You route one operating task to the single best Google Chat space where the "
     "responsible person is likely active. Choose ONLY from the supplied catalog ids. "
