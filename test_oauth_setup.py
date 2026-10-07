@@ -10,6 +10,7 @@ class ScopesAndSteps(unittest.TestCase):
         self.assertIn("https://www.googleapis.com/auth/chat.messages.readonly", oauth_setup.scopes_for("chat"))
         self.assertIn("https://www.googleapis.com/auth/gmail.readonly", oauth_setup.scopes_for("gmail"))
         self.assertIn("https://www.googleapis.com/auth/drive.file", oauth_setup.scopes_for("drive"))
+        self.assertIn("https://www.googleapis.com/auth/tasks", oauth_setup.scopes_for("tasks"))
         with self.assertRaises(ValueError):
             oauth_setup.scopes_for("nope")
 

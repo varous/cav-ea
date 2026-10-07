@@ -45,6 +45,11 @@ SCOPES = {
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/drive.file",
     ],
+    "tasks": [
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/tasks",
+    ],
 }
 
 

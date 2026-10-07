@@ -437,6 +437,15 @@ class Controls(unittest.TestCase):
         self.assertIn('🟠 UP NEXT',lines)
         self.assertTrue(any(l.startswith('🔴') and 'T-101' in l for l in lines))
         self.assertFalse(any(l.startswith('🟢') for l in lines))
+    def test_recap_uses_full_subject_without_ellipsis(self):
+        from app import recap_lines
+        state=import_ledger(BASE)
+        long_title='Confirm final load-in schedule and crew call times with the venue manager before the weekend'
+        state['tasks']['T-101']={'id':'T-101','title':long_title,'owner':'PERSON_A','deadline':'2020-01-01','status':'OUTSTANDING'}
+        lines=recap_lines(state)
+        line=[l for l in lines if 'T-101' in l][0]
+        self.assertIn('venue manager before the weekend',line)
+        self.assertNotIn('…',line)
     def test_create_reply_gets_signal(self):
         from app import with_create_signals
         state=import_ledger(BASE); before=set(state['tasks'])

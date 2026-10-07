@@ -125,7 +125,8 @@ def import_ledger(text):
             task_id,title,owner,deadline,dependency=cells[:5]
             tasks[task_id]={'id':task_id,'title':title,'owner':owner,'deadline':deadline,
                 'dependency':dependency,'status':'OUTSTANDING','priority':'UNKNOWN','details':'',
-                'source':'Imported canonical ledger C-007; user-reported baseline'}
+                'source':'Imported canonical ledger C-007; user-reported baseline',
+                'google_task_id':None,'google_synced':None}
     if not tasks: raise RuntimeError('LEDGER_TASK_IMPORT_FAILED')
     commits=[int(x) for x in re.findall(r'### C-(\d+)',text)]
     return {'schema':1,'mode':'validation','baseline_sha256':digest(text),'baseline_commit':max(commits),
@@ -229,27 +230,42 @@ def explicit_completion(state,message,thread=None):
         'reason':'Explicit owner completion confirmation'+(' resolved in the same thread' if evidence!=message else '')}]}
     return result,evidence+'\n'+message
 
-def apply_changes(state,changes,source,owner_name='the owner'):
+def apply_changes(state,changes,source,owner_name='the owner',mirror=None):
     state=copy.deepcopy(state)
+    affected=[]
     for c in changes:
         old=None; task_id=c['task_id']
         if c['kind']=='create':
             existing={int(re.match(r'T-(\d+)',x)[1]) for x in state['tasks']}
             task_id=f'T-{max(existing)+1:03d}'
             state['tasks'][task_id]={'id':task_id,'title':c['value'],'owner':'NOT YET ASSIGNED',
-                'deadline':'UNKNOWN','dependency':'UNKNOWN','status':'OUTSTANDING','priority':'UNKNOWN','details':'','source':source}
+                'deadline':'UNKNOWN','dependency':'UNKNOWN','status':'OUTSTANDING','priority':'UNKNOWN','details':'','source':source,
+                'google_task_id':None,'google_synced':None}
             state['tasks'][task_id].update(c.get('new_task',{}))
             alias=requested_alias(c.get('evidence_quote',''),task_id)
             if alias: state['tasks'][task_id]['alias']=alias
+            affected.append(task_id)
         elif c['kind']=='update':
             old=state['tasks'][task_id].get(c['field'])
             state['tasks'][task_id][c['field']]=c['value']; state['tasks'][task_id]['source']=source
+            affected.append(task_id)
         else: state['decisions'].append({'text':c['value'],'source':source,'time':now()})
         commit=state['baseline_commit']+len(state['changes'])+1
         state['changes'].append({'commit':f'C-{commit:03d}','time':now(),'kind':c['kind'],
             'task_id':task_id,'field':c['field'],'old':old,'new':c['value'],'reason':c['reason'],
             'evidence_quote':c['evidence_quote'],'authority':'confirmed/instructed by '+owner_name,
             'source':source,'validation':state['mode']!='active'})
+    # One-way mirror to Google Tasks. A sync failure must never fail the change:
+    # record a code-only error on the task and retry on the next run.
+    if mirror:
+        for task_id in dict.fromkeys(affected):
+            try:
+                mirror(state,task_id)
+                state['tasks'][task_id].pop('tasks_sync_error',None)
+            except Exception as e:
+                code=str(e) if isinstance(e,RuntimeError) and re.fullmatch(r'[A-Z0-9_]+',str(e)) else type(e).__name__
+                state['tasks'][task_id]['tasks_sync_error']=code
+                print(json.dumps({'status':'TASKS_SYNC_ERROR','code':code,'task_id':task_id,'time':now()}),flush=True)
     return state
 
 def export_ledger(original,state):

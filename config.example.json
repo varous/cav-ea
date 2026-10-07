@@ -11,6 +11,7 @@
   "project": "your-project",
   "region": "asia-south1",
   "resource_prefix": "ea",
+  "tasklist_id": null,
   "model": {
     "provider": "deepseek",
     "base_url": "https://api.deepseek.com",

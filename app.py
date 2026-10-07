@@ -11,6 +11,7 @@ import requests
 from attachments import ingest as ingest_attachment,context as attachment_context
 from storage import Store, Busy
 from operating import now, digest, IST, RULES, RULES_TEMPLATE, render_rules, RESULT_SCHEMA, validate_changes, apply_changes, export_ledger,explicit_completion,referenced_tasks
+import tasks as tasks_api
 
 app=Flask(__name__)
 PROJECT=os.environ.get('GOOGLE_CLOUD_PROJECT','your-project')
@@ -37,6 +38,7 @@ def build_settings(config):
     s['owner_email']=os.environ.get('OWNER_EMAIL',c.get('owner_email') or s['owner_email'])
     s['assistant_name']=os.environ.get('ASSISTANT_NAME',c.get('assistant_name') or s['assistant_name'])
     s['owner_name']=c.get('owner_name') or s['owner_name']
+    s['tasklist_id']=c.get('tasklist_id')
     s['timezone']=os.environ.get('ASSISTANT_TIMEZONE',c.get('timezone') or s['timezone'])
     s['recap_hours']=os.environ.get('RECAP_HOURS',c.get('recap_hours') or s['recap_hours'])
     validate_settings(s)
@@ -288,7 +290,7 @@ def tasks_for_context(state,user_text,kind,owner=None,evidence_ids=None):
         full |= set(evidence_ids or [])
     out={}
     for tid,t in tasks.items():
-        if tid in full: out[tid]=t
+        if tid in full: out[tid]={k:v for k,v in t.items() if k not in ('google_task_id','google_synced','tasks_sync_error')}
         else: out[tid]=(f"{tid} — {t.get('title')} — owner {t.get('owner')} — due {t.get('deadline')} — {t.get('status')}")
     return out
 
@@ -322,6 +324,13 @@ def short_subject(title,max_words=6,max_chars=48):
         if ' ' in cut: cut=cut[:cut.rfind(' ')]
         text=cut; truncated=True
     return text.rstrip(' ,;-·')+('…' if truncated else '')
+def recap_subject(title,max_chars=200):
+    """Full subject for the recap: no mid-sentence ellipsis, only a high safety cap."""
+    text=(title or '').strip()
+    if len(text)<=max_chars: return text
+    cut=text[:max_chars]
+    if ' ' in cut: cut=cut[:cut.rfind(' ')]
+    return cut.rstrip(' ,;-·')
 def owner_missing(task):
     o=((task or {}).get('owner') or '').strip().lower()
     return (not o) or o in ('unknown','not yet assigned','unassigned') or 'not yet assigned' in o
@@ -394,7 +403,7 @@ def recap_lines(state,act_cap=5,total_cap=10):
     today=dt.datetime.now(IST).date(); act=[]; nxt=[]
     for tid,t in state['tasks'].items():
         if t.get('status') in ('COMPLETED','CANCELLED'): continue
-        d=_deadline_date(t); subj=short_subject(t.get('title')); due=format_due(t.get('deadline'))
+        d=_deadline_date(t); subj=recap_subject(t.get('title')); due=format_due(t.get('deadline'))
         if owner_missing(t) and d and d<=today:
             act.append(f"🔴 {tid} {subj} — needs owner"); continue
         if t.get('status')=='BLOCKED' or (d and d<today):
@@ -547,6 +556,25 @@ class Runtime:
     @cached_property
     def gmail(self): return user_session('GMAIL_USER_JSON')[0]
     @cached_property
+    def tasks(self): return user_session('TASKS_USER_JSON')[0]
+    def ensure_tasklist(self):
+        """Return the dedicated Tasks list id (title=assistant_name), persisting it in config."""
+        existing=(self.settings or {}).get('tasklist_id')
+        tasklist_id=tasks_api.ensure_tasklist(self.tasks,self.settings['assistant_name'],existing)
+        if tasklist_id!=existing: self.persist_tasklist(tasklist_id)
+        return tasklist_id
+    def persist_tasklist(self,tasklist_id):
+        self.settings['tasklist_id']=tasklist_id
+        config=dict(self.config or {}); config['tasklist_id']=tasklist_id
+        try:
+            self.config_generation=self.store.write('config.json',config,self.config_generation)
+            self.config=config
+        except Exception:
+            pass
+    def mirror(self,state,task_id):
+        """Best-effort one-way write to Google Tasks; callers guard failures."""
+        tasks_api.mirror_task(self.tasks,self.ensure_tasklist(),state,task_id)
+    @cached_property
     def bot(self):
         adc,_=google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
         signer=iam.Signer(Request(),adc,RUNTIME)
@@ -669,7 +697,7 @@ class Runtime:
             source='https://chat.google.com/room/'+self.space.split('/')[1]+' — '+name
             before_ids=set(state['tasks'])
             owner_name=(getattr(self,'settings',None) or {}).get('owner_name','the owner')
-            state=apply_changes(state,changes,source,owner_name)
+            state=apply_changes(state,changes,source,owner_name,getattr(self,'mirror',None))
             reply=with_create_signals(state,before_ids,result['reply'])
             state['processed'][key]={'source':name,'time':now(),'changes':len(changes),
                 'clarification':result['clarification_required'],'message_create_time':message.get('createTime')}
@@ -886,6 +914,13 @@ def model_status():
     hist=list(reversed(((state or {}).get('model_history') or [])[-20:]))
     return jsonify(latest=hist[0] if hist else dict(MODEL_TELEMETRY),history=hist)
 
+@app.post('/admin/setup-tasks')
+def setup_tasks():
+    # Owner-only: create/reuse the dedicated Tasks list and store its id in config.
+    runtime=Runtime()
+    tasklist_id=runtime.ensure_tasklist()
+    return jsonify(status='READY',tasklist_id=tasklist_id,assistant_name=runtime.settings['assistant_name'])
+
 @app.post('/events')
 def events():
     runtime=Runtime(); body=request.get_json(force=True)
@@ -965,7 +1000,7 @@ def retry_clarification():
         if result['clarification_required']: return jsonify(status='STILL_UNRESOLVED')
         before_ids=set(state['tasks'])
         owner_name=(getattr(runtime,'settings',None) or {}).get('owner_name','the owner')
-        state=apply_changes(state,changes,prior['source'],owner_name)
+        state=apply_changes(state,changes,prior['source'],owner_name,runtime.mirror)
         prior_reply=with_create_signals(state,before_ids,result['reply'])
         prior['clarification_required']=False;prior['assistant_reply']=prior_reply;prior['repaired_at']=now()
         if any(c['kind']=='create' for c in changes):
