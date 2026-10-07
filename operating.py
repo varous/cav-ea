@@ -268,6 +268,39 @@ def apply_changes(state,changes,source,owner_name='the owner',mirror=None):
                 print(json.dumps({'status':'TASKS_SYNC_ERROR','code':code,'task_id':task_id,'time':now()}),flush=True)
     return state
 
+def apply_tasks_sync(state,changes,owner_name='the owner'):
+    """Append-only apply of Tasks-driven changes (no message evidence_quote required).
+
+    Used only by the read-back path: the evidence is the Google Tasks state change
+    and its timestamp. It never invents attribution and never completes a task that
+    was not completed in Tasks (callers only emit COMPLETED for Google-completed tasks).
+    """
+    state=copy.deepcopy(state)
+    for c in changes:
+        old=None
+        if c['kind']=='create':
+            existing={int(re.match(r'T-(\d+)',x)[1]) for x in state['tasks']}
+            task_id=f'T-{max(existing)+1:03d}'
+            state['tasks'][task_id]={'id':task_id,'title':c.get('title') or '','owner':owner_name,
+                'deadline':c.get('deadline') or 'UNKNOWN','dependency':'UNKNOWN',
+                'status':c.get('status') or 'OUTSTANDING','priority':'UNKNOWN','details':c.get('details') or '',
+                'source':'created in Google Tasks','google_task_id':c.get('google_task_id'),'google_synced':None}
+            new_value=c.get('title')
+        else:
+            task_id=c['task_id']
+            old=state['tasks'][task_id].get(c['field'])
+            state['tasks'][task_id][c['field']]=c['value']; state['tasks'][task_id]['source']='Google Tasks'
+            if c.get('google_task_id'): state['tasks'][task_id]['google_task_id']=c['google_task_id']
+            if c.get('google_synced') is not None: state['tasks'][task_id]['google_synced']=c['google_synced']
+            new_value=c.get('value')
+        commit=state['baseline_commit']+len(state['changes'])+1
+        state['changes'].append({'commit':f'C-{commit:03d}','time':now(),'kind':c['kind'],
+            'task_id':task_id,'field':c.get('field'),'old':old,'new':new_value,
+            'reason':c.get('reason',''),'evidence_quote':c.get('evidence',''),
+            'authority':'confirmed/instructed by '+owner_name,'source':'Google Tasks',
+            'validation':state['mode']!='active'})
+    return state
+
 def export_ledger(original,state):
     """Render current cloud facts separately from the unchanged historical baseline."""
     def cell(value):

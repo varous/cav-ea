@@ -10,7 +10,7 @@ from google.oauth2 import credentials, service_account, id_token
 import requests
 from attachments import ingest as ingest_attachment,context as attachment_context
 from storage import Store, Busy
-from operating import now, digest, IST, RULES, RULES_TEMPLATE, render_rules, RESULT_SCHEMA, validate_changes, apply_changes, export_ledger,explicit_completion,referenced_tasks
+from operating import now, digest, IST, RULES, RULES_TEMPLATE, render_rules, RESULT_SCHEMA, validate_changes, apply_changes, apply_tasks_sync, export_ledger,explicit_completion,referenced_tasks
 import tasks as tasks_api
 
 app=Flask(__name__)
@@ -574,6 +574,17 @@ class Runtime:
     def mirror(self,state,task_id):
         """Best-effort one-way write to Google Tasks; callers guard failures."""
         tasks_api.mirror_task(self.tasks,self.ensure_tasklist(),state,task_id)
+    def sync_tasks(self,state):
+        """Read-back: apply owner completion/reopen/edits from Google Tasks (loop-safe)."""
+        tasklist_id=self.ensure_tasklist()
+        changes=tasks_api.sync_from_tasks(self.tasks,tasklist_id,state,self.settings['owner_name'])
+        if changes: state=apply_tasks_sync(state,changes,self.settings['owner_name'])
+        for c in changes:
+            if c.get('mirror_back') and c.get('task_id'):
+                self.mirror(state,c['task_id'])
+        state.setdefault('coverage',{})['tasks']={'status':'SUCCESS','time':now(),'changes':len(changes)}
+        return state
+    def intake_tasks(self,state): return self.sync_tasks(state)
     @cached_property
     def bot(self):
         adc,_=google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
@@ -798,9 +809,11 @@ class Runtime:
             'scope':'gmail.readonly; incoming only; from activation plus one labelled verification sample',
             'gap':latest_gap_text(state,'gmail_') or 'No known checkpoint gap; deleted/unavailable content cannot be recovered.'}
     def intake(self,state,generation):
-        for name,method in [('chat',self.intake_chat),('gmail',self.intake_gmail)]:
+        for name,method in [('chat',self.intake_chat),('gmail',self.intake_gmail),('tasks',self.intake_tasks)]:
             before=copy.deepcopy(state)
-            try: method(state)
+            try:
+                result=method(state)
+                if result is not None: state=result
             except Exception as e:
                 state=before; state['coverage'][name]={'status':'ERROR','time':now(),'code':safe_code(e)}
                 # Codes only; never source text, tokens or headers.
@@ -920,6 +933,24 @@ def setup_tasks():
     runtime=Runtime()
     tasklist_id=runtime.ensure_tasklist()
     return jsonify(status='READY',tasklist_id=tasklist_id,assistant_name=runtime.settings['assistant_name'])
+
+@app.post('/admin/sync-tasks')
+def sync_tasks_admin():
+    # Owner-only manual reconciliation of owner completion/reopen/edits from Google Tasks.
+    runtime=Runtime()
+    with runtime.store.locked():
+        runtime.guard_space()
+        state,generation=runtime.store.get('state.json')
+        if not state: raise RuntimeError('STATE_MIGRATION_REQUIRED')
+        before=copy.deepcopy(state)
+        try:
+            state=runtime.sync_tasks(state)
+        except Exception as e:
+            state=before; state.setdefault('coverage',{})['tasks']={'status':'ERROR','time':now(),'code':safe_code(e)}
+            runtime.store.save(state,generation)
+            return jsonify(status='ERROR',code=safe_code(e))
+        generation=runtime.store.save(state,generation)
+        return jsonify(status='SUCCESS',changes=(state['coverage'].get('tasks') or {}).get('changes',0))
 
 @app.post('/events')
 def events():

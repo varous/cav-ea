@@ -2,7 +2,7 @@
 import unittest
 
 import tasks
-from operating import apply_changes, import_ledger
+from operating import apply_changes, apply_tasks_sync, import_ledger
 
 LEDGER = """| ID | Project / task | Owner | Deadline | Dependency |
 |---|---|---|---|---|
@@ -159,6 +159,108 @@ class Schema(unittest.TestCase):
         task = created["tasks"]["T-102"]
         self.assertIsNone(task["google_task_id"])
         self.assertIsNone(task["google_synced"])
+
+
+class ReadBack(unittest.TestCase):
+    def synced_state(self):
+        s = state()
+        task = s["tasks"]["T-101"]
+        task["google_task_id"] = "gt-1"
+        task["google_synced"] = {"title": task["title"], "status": "needsAction",
+                                 "due": tasks._date("2026-10-05"), "notes": tasks.notes_for(task),
+                                 "updated": "2026-10-01T00:00:00.000Z"}
+        return s
+
+    def google(self, **over):
+        task = {"id": "gt-1", "title": "Sample task one", "status": "needsAction",
+                "due": "2026-10-05T00:00:00.000Z", "notes": "[ea-task:T-101]",
+                "updated": "2026-10-07T10:00:00.000Z"}
+        task.update(over)
+        return task
+
+    def test_completion_from_tasks(self):
+        s = self.synced_state()
+        session = Session(list_items=[self.google(status="completed", completed="2026-10-07T10:00:00.000Z")])
+        changes = tasks.sync_from_tasks(session, "list-1", s, "Alex Owner")
+        statuses = [c for c in changes if c["field"] == "status"]
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(statuses[0]["value"], "COMPLETED")
+        self.assertIn("confirmed by owner via Google Tasks", statuses[0]["reason"])
+        applied = apply_tasks_sync(s, changes, "Alex Owner")
+        self.assertEqual(applied["tasks"]["T-101"]["status"], "COMPLETED")
+        self.assertEqual(applied["changes"][-1]["source"], "Google Tasks")
+        self.assertIn("Google Tasks completed", applied["changes"][-1]["evidence_quote"])
+
+    def test_reopen_reverts_and_preserves_history(self):
+        s = self.synced_state()
+        s["tasks"]["T-101"]["status"] = "COMPLETED"
+        s["tasks"]["T-101"]["google_synced"]["status"] = "completed"
+        s["changes"].append({"commit": "C-002", "time": "2026-10-06T00:00:00Z", "kind": "update",
+                             "task_id": "T-101", "field": "status", "old": "OUTSTANDING", "new": "COMPLETED",
+                             "reason": "done", "evidence_quote": "T-101 done", "authority": "x",
+                             "source": "chat", "validation": False})
+        session = Session(list_items=[self.google(status="needsAction")])
+        changes = tasks.sync_from_tasks(session, "list-1", s, "Alex Owner")
+        self.assertEqual([c["value"] for c in changes if c["field"] == "status"], ["OUTSTANDING"])
+        applied = apply_tasks_sync(s, changes, "Alex Owner")
+        self.assertEqual(applied["tasks"]["T-101"]["status"], "OUTSTANDING")
+        history = [c for c in applied["changes"] if c["field"] == "status"]
+        self.assertTrue(any(c["new"] == "COMPLETED" for c in history))
+        self.assertTrue(any(c["new"] == "OUTSTANDING" for c in history))
+
+    def test_echo_loop_prevention_no_change(self):
+        s = self.synced_state()
+        session = Session(list_items=[self.google()])
+        self.assertEqual(tasks.sync_from_tasks(session, "list-1", s, "Alex Owner"), [])
+
+    def test_idempotent_rerun_is_noop(self):
+        s = self.synced_state()
+        session = Session(list_items=[self.google(status="completed", completed="2026-10-07T10:00:00.000Z")])
+        first = tasks.sync_from_tasks(session, "list-1", s, "Alex Owner")
+        applied = apply_tasks_sync(s, first, "Alex Owner")
+        second = tasks.sync_from_tasks(session, "list-1", applied, "Alex Owner")
+        self.assertEqual(second, [])
+
+    def test_owner_created_task_is_imported(self):
+        s = state()
+        created = {"id": "gt-new", "title": "Buy cables", "notes": "owner note",
+                   "due": "2026-10-09T00:00:00.000Z", "status": "needsAction",
+                   "updated": "2026-10-07T11:00:00.000Z"}
+        session = Session(list_items=[created])
+        changes = tasks.sync_from_tasks(session, "list-1", s, "Alex Owner")
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["kind"], "create")
+        self.assertTrue(changes[0]["mirror_back"])
+        self.assertEqual(changes[0]["google_task_id"], "gt-new")
+        applied = apply_tasks_sync(s, changes, "Alex Owner")
+        new_id = changes[0].get("task_id") or applied["changes"][-1]["task_id"]
+        task = applied["tasks"][new_id]
+        self.assertEqual(task["title"], "Buy cables")
+        self.assertEqual(task["details"], "owner note")
+        self.assertEqual(task["deadline"], "2026-10-09")
+        self.assertEqual(task["owner"], "Alex Owner")
+        self.assertEqual(task["source"], "created in Google Tasks")
+        self.assertEqual(task["google_task_id"], "gt-new")
+
+    def test_owner_title_edit_is_applied(self):
+        s = self.synced_state()
+        session = Session(list_items=[self.google(title="Sample task one (renamed)")])
+        changes = tasks.sync_from_tasks(session, "list-1", s, "Alex Owner")
+        self.assertEqual([c for c in changes if c["field"] == "title"][0]["value"], "Sample task one (renamed)")
+
+
+class TasksUnavailable(unittest.TestCase):
+    def test_sync_error_recorded_not_raised(self):
+        from unittest.mock import Mock
+        from app import Runtime
+        runtime = object.__new__(Runtime)
+        runtime.store = Mock()
+        runtime.intake_chat = lambda state: None
+        runtime.intake_gmail = lambda state: None
+        runtime.intake_tasks = lambda state: (_ for _ in ()).throw(RuntimeError("TASKS_UNAVAILABLE"))
+        state, _ = runtime.intake({"coverage": {}}, 0)
+        self.assertEqual(state["coverage"]["tasks"]["status"], "ERROR")
+        self.assertEqual(state["coverage"]["tasks"]["code"], "TASKS_UNAVAILABLE")
 
 
 if __name__ == "__main__":

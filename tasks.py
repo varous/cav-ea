@@ -117,3 +117,94 @@ def mirror_task(session, tasklist_id, state, task_id):
     task["google_task_id"] = google_task_id
     task["google_synced"] = dict(want, updated=now())
     return google_task_id
+
+
+# --- read-back (Tasks -> bot) -------------------------------------------------
+
+_MARKER_RE = re.compile(r"\[ea-task:(T-[A-Za-z0-9]+)\]")
+
+
+def marker_id(notes):
+    match = _MARKER_RE.search(notes or "")
+    return match.group(1) if match else None
+
+
+def _strip_marker(notes):
+    return _MARKER_RE.sub("", notes or "").rstrip()
+
+
+def _date(value):
+    text = (value or "").strip()
+    return text[:10] if re.match(r"\d{4}-\d{2}-\d{2}", text) else None
+
+
+def snapshot(google_task):
+    """The Google-side state stored in google_synced for loop-safe diffing."""
+    return {
+        "title": (google_task.get("title") or "").strip(),
+        "status": google_task.get("status") or "needsAction",
+        "due": _date(google_task.get("due")),
+        "notes": google_task.get("notes") or "",
+        "updated": google_task.get("updated"),
+    }
+
+
+def _task_changes(task_id, synced, google_task):
+    """Diff a Google task against the bot's last write. Empty when unchanged (no echo)."""
+    snap = snapshot(google_task)
+    previous = (synced or {}).get("status")
+    stamp = google_task.get("updated") or ""
+    changes = []
+    # Status: the bot only mirrors completed/needsAction, so any divergence is the owner.
+    if snap["status"] == "completed" and previous != "completed":
+        changes.append(("status", "COMPLETED", "confirmed by owner via Google Tasks",
+                        "Google Tasks completed " + (google_task.get("completed") or stamp)))
+    elif snap["status"] != "completed" and previous == "completed":
+        changes.append(("status", "OUTSTANDING", "reopened by owner via Google Tasks",
+                        "Google Tasks reopened " + stamp))
+    if synced:
+        if snap["title"] != (synced.get("title") or ""):
+            changes.append(("title", snap["title"], "owner edited the title in Google Tasks",
+                            "Google Tasks edited " + stamp))
+        if snap["due"] != _date(synced.get("due")):
+            changes.append(("deadline", snap["due"] or "UNKNOWN",
+                            "owner changed the due date in Google Tasks", "Google Tasks edited " + stamp))
+        if snap["notes"] != (synced.get("notes") or ""):
+            changes.append(("details", _strip_marker(snap["notes"]),
+                            "owner edited notes in Google Tasks", "Google Tasks edited " + stamp))
+    return changes
+
+
+def sync_from_tasks(session, tasklist_id, state, owner_name):
+    """Read-back: return deterministic changes for completion, reopen, edits and imports.
+
+    Never returns a change for the bot's own writes: each task is diffed against the
+    google_synced snapshot, and the snapshot is refreshed after applying.
+    """
+    changes = []
+    for google_task in _items(session, API + "/lists/" + tasklist_id + "/tasks", "items",
+                              {"showCompleted": "true", "showHidden": "true"}):
+        google_task_id = google_task.get("id")
+        task_id = marker_id(google_task.get("notes"))
+        if task_id and task_id in state["tasks"]:
+            task = state["tasks"][task_id]
+            task["google_task_id"] = task.get("google_task_id") or google_task_id
+            diffs = _task_changes(task_id, task.get("google_synced"), google_task)
+            for index, (field, value, reason, evidence) in enumerate(diffs):
+                change = {"kind": "update", "task_id": task_id, "field": field, "value": value,
+                          "reason": reason, "evidence": evidence, "google_task_id": google_task_id}
+                if index == len(diffs) - 1:
+                    change["google_synced"] = snapshot(google_task)
+                changes.append(change)
+        elif not task_id:
+            # No marker: the owner created it directly in Tasks -> import, then mirror back.
+            snap = snapshot(google_task)
+            changes.append({
+                "kind": "create", "title": snap["title"], "details": _strip_marker(snap["notes"]),
+                "deadline": snap["due"] or "UNKNOWN",
+                "status": "COMPLETED" if snap["status"] == "completed" else "OUTSTANDING",
+                "google_task_id": google_task_id, "mirror_back": True,
+                "reason": "created in Google Tasks",
+                "evidence": "Google Tasks created " + (google_task.get("updated") or ""),
+            })
+    return changes
