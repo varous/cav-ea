@@ -1,0 +1,23 @@
+{
+  "_comment": "Deployment identity + assistant config. Stored as config.json in the state bucket. Required: owner_email, owner_user, space_id, bot_id.",
+  "assistant_name": "my-ea",
+  "owner_name": "PERSON_A",
+  "owner_email": "owner@example.com",
+  "owner_user": "users/000000000000000000000",
+  "space_id": "spaces/XXXXXXXXXXXX",
+  "bot_id": "000000000000000000000",
+  "timezone": "Asia/Kolkata",
+  "recap_hours": "9,12,15,18,21",
+  "project": "your-project",
+  "region": "asia-south1",
+  "resource_prefix": "ea",
+  "model": {
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-pro",
+    "max_tokens": 8000,
+    "retry_max_tokens": 16000,
+    "timeout": 150,
+    "context_max_chars": 70000
+  }
+}

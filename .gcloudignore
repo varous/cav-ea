@@ -1,0 +1,8 @@
+*
+!.gcloudignore
+!Dockerfile
+!requirements.txt
+!app.py
+!attachments.py
+!storage.py
+!operating.py

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local/private
+.private/
+config.json
+*.local.json
+*.key
+*client_secret*.json
+knowledge/
+.env
+
+# OS
+.DS_Store
