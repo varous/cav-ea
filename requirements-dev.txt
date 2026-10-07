@@ -1,0 +1,2 @@
+# Test-only dependencies (not part of the runtime image).
+PyYAML==6.0.2

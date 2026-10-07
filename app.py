@@ -14,7 +14,7 @@ from operating import now, digest, IST, RULES, RULES_TEMPLATE, render_rules, RES
 
 app=Flask(__name__)
 PROJECT=os.environ.get('GOOGLE_CLOUD_PROJECT','your-project')
-PREFIX=os.environ.get('CLOCKWORK_RESOURCE_PREFIX','ea')
+PREFIX=os.environ.get('RESOURCE_PREFIX','ea')
 TRIGGER=PREFIX+'-trigger@'+PROJECT+'.iam.gserviceaccount.com'
 RUNTIME=PREFIX+'-runtime@'+PROJECT+'.iam.gserviceaccount.com'
 OWNER=os.environ.get('OWNER_EMAIL','owner@example.com')
@@ -780,7 +780,7 @@ class Runtime:
         return state,generation
     def maintain(self):
         endpoint='https://workspaceevents.googleapis.com/v1/'
-        topic='projects/'+PROJECT+'/topics/ea-events'
+        topic='projects/'+PROJECT+'/topics/'+PREFIX+'-events'
         candidates=list(pages(self.user,endpoint+'subscriptions','subscriptions',{'filter':'event_types:"google.workspace.chat.message.v1.created" AND target_resource = "//chat.googleapis.com/'+self.space+'"'}))
         matches=[x for x in candidates if x.get('notificationEndpoint',{}).get('pubsubTopic')==topic]
         current=matches[0] if matches else None
@@ -849,7 +849,7 @@ def safe_code(e):
 def authenticate():
     # Cloud Run IAM authenticates every request before this handler; enforce route identity too.
     if request.path=='/health': return None
-    token=request.headers.get('X-Clockwork-Identity',request.headers.get('Authorization','')).removeprefix('Bearer ')
+    token=request.headers.get('X-EA-Identity',request.headers.get('Authorization','')).removeprefix('Bearer ')
     try: claims=id_token.verify_oauth2_token(token,Request(),audience=None)
     except Exception as e:
         print(json.dumps({'auth_error':type(e).__name__,'jwt_parts':len(token.split('.')),
@@ -888,7 +888,7 @@ def model_status():
 @app.post('/events')
 def events():
     runtime=Runtime(); body=request.get_json(force=True)
-    expected='projects/'+PROJECT+'/subscriptions/ea-events-push'
+    expected='projects/'+PROJECT+'/subscriptions/'+PREFIX+'-events-push'
     if body.get('subscription')!=expected: return jsonify(code='SUBSCRIPTION_DENIED'),403
     message=body.get('message',{}); kind=message.get('attributes',{}).get('ce-type','')
     if not kind.startswith('google.workspace.chat.message.v1.'): return jsonify(status='IGNORED')
@@ -899,7 +899,7 @@ def events():
     if not names: return jsonify(status='IGNORED')
     # Queue only resource names. Source contents are fetched with read-only user credentials.
     work=base64.b64encode(json.dumps({'message_names':names}).encode()).decode()
-    checked(runtime.cloud.post('https://pubsub.googleapis.com/v1/projects/'+PROJECT+'/topics/ea-work:publish',
+    checked(runtime.cloud.post('https://pubsub.googleapis.com/v1/projects/'+PROJECT+'/topics/'+PREFIX+'-work:publish',
         json={'messages':[{'data':work}]},timeout=30))
     return jsonify(status='QUEUED')
 
