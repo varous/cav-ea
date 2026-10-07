@@ -12,6 +12,7 @@ from attachments import ingest as ingest_attachment,context as attachment_contex
 from storage import Store, Busy
 from operating import now, digest, IST, RULES, RULES_TEMPLATE, render_rules, RESULT_SCHEMA, validate_changes, apply_changes, apply_tasks_sync, export_ledger,explicit_completion,referenced_tasks
 import tasks as tasks_api
+import routing
 
 app=Flask(__name__)
 PROJECT=os.environ.get('GOOGLE_CLOUD_PROJECT','your-project')
@@ -39,6 +40,7 @@ def build_settings(config):
     s['assistant_name']=os.environ.get('ASSISTANT_NAME',c.get('assistant_name') or s['assistant_name'])
     s['owner_name']=c.get('owner_name') or s['owner_name']
     s['tasklist_id']=c.get('tasklist_id')
+    s['people']=c.get('people') or {}
     s['timezone']=os.environ.get('ASSISTANT_TIMEZONE',c.get('timezone') or s['timezone'])
     s['recap_hours']=os.environ.get('RECAP_HOURS',c.get('recap_hours') or s['recap_hours'])
     validate_settings(s)
@@ -599,6 +601,88 @@ class Runtime:
         state,_=self.backfill_tasks(state)
         return self.read_back_tasks(state)
     def intake_tasks(self,state): return self.read_back_tasks(state)
+    @property
+    def people(self): return (self.settings or {}).get('people') or {}
+    def space_catalog(self):
+        spaces=list(pages(self.user,CHAT+'spaces','spaces',{'pageSize':1000}))
+        return routing.build_catalog(spaces,exclude_ids=[self.space])
+    def member_user_id(self,space_id,person):
+        members=list(pages(self.user,CHAT+space_id+'/members','memberships',{'pageSize':1000}))
+        return routing.member_user_id(members,person)
+    def model_json(self,system,user): return complete_with_headroom(system,user)
+    def post_to_space(self,space_id,text,message_id,key):
+        import uuid
+        resource=space_id+'/messages/'+message_id
+        r=self.bot.get(CHAT+resource,timeout=30)
+        # Deterministic client id: creating again is idempotent; a collision looks up the receipt.
+        if r.status_code in (403,404):
+            r=self.bot.post(CHAT+space_id+'/messages',
+                params={'messageId':message_id,'requestId':str(uuid.uuid5(uuid.NAMESPACE_URL,key))},
+                json={'text':text},timeout=60)
+            if r.status_code==409: r=self.bot.get(CHAT+resource,timeout=30)
+        receipt=checked(r)
+        if not receipt.get('name','').startswith(space_id+'/messages/'):
+            raise RuntimeError('ROUTE_RECEIPT_MISMATCH')
+        return receipt['name']
+    def ask_route_space(self,state,task,candidates):
+        if not candidates: return
+        lines=['Which space should this task go to? ('+task['id']+' — '+(task.get('title') or '')+')']
+        for index,candidate in enumerate(candidates,1):
+            lines.append(f"{index}. {candidate.get('name') or candidate['space_id']}")
+        add_outbox(state,self.space,'route-ask:'+task['id'],'\n'.join(lines))
+    def deliver_route(self,state,task,person,space_id):
+        user_id=self.member_user_id(space_id,person)
+        if not user_id:
+            task['route_status']='unresolved_member'; task['route_space_id']=space_id; task['route_error']='MEMBER_NOT_FOUND'; return
+        message_id='client-cw-route-'+digest(task['id'])[:40]
+        receipt=self.post_to_space(space_id,routing.delivery_text(user_id,task),message_id,'route:'+task['id'])
+        task['route_space_id']=space_id; task['route_message_id']=receipt
+        task['route_status']='delivered'; task['route_delivered']=now(); task.pop('route_error',None)
+    def route(self,state,task_id):
+        """Route a non-owner task to its Chat space; never raises through apply_changes."""
+        task=state['tasks'].get(task_id)
+        if not task or not self.people: return
+        if tasks_api.is_owner_task(task,self.settings['owner_name'],self.settings.get('owner_email')): return
+        if task.get('route_status')=='delivered': return
+        resolved=routing.resolve_person(self.people,task.get('owner'))
+        if resolved=='AMBIGUOUS':
+            task['route_status']='unresolved_person'; task['route_error']='OWNER_AMBIGUOUS'; return
+        if not resolved:
+            task['route_status']='unresolved_person'; task['route_error']='OWNER_UNRESOLVED'; return
+        canonical,person=resolved
+        task['route_target']=canonical
+        catalog=self.space_catalog()
+        names={entry['space_id']:entry['name'] for entry in catalog}
+        space_id,candidates=routing.resolve_space(self.model_json,task,catalog)
+        candidates=[{**c,'name':names.get(c['space_id'],'')} for c in candidates]
+        if not space_id:
+            task['route_status']='awaiting'; task['route_candidates']=candidates
+            self.ask_route_space(state,task,candidates); return
+        self.deliver_route(state,task,person,space_id)
+    def pick_space(self,text,candidates):
+        normalized=routing.normalize(text)
+        for index,candidate in enumerate(candidates or [],1):
+            if normalized==str(index): return candidate['space_id']
+        for candidate in candidates or []:
+            name=routing.normalize(candidate.get('name'))
+            if name and name in normalized: return candidate['space_id']
+        return None
+    def apply_route_reply(self,state,text):
+        """Owner named a candidate space: deliver the deferred tasks it matches."""
+        for task in [t for t in state['tasks'].values() if t.get('route_status')=='awaiting']:
+            space_id=self.pick_space(text,task.get('route_candidates'))
+            if not space_id: continue
+            resolved=routing.resolve_person(self.people,task.get('owner'))
+            if not resolved or resolved=='AMBIGUOUS': continue
+            _,person=resolved
+            self.deliver_route(state,task,person,space_id)
+    def route_pending(self,state):
+        for task_id,task in list(state['tasks'].items()):
+            if task.get('route_status') in ('delivered','awaiting'): continue
+            if tasks_api.is_owner_task(task,self.settings['owner_name'],self.settings.get('owner_email')): continue
+            try: self.route(state,task_id)
+            except Exception as error:
+                task['route_error']=safe_code(error)
     @cached_property
     def bot(self):
         adc,_=google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
@@ -722,7 +806,8 @@ class Runtime:
             source='https://chat.google.com/room/'+self.space.split('/')[1]+' — '+name
             before_ids=set(state['tasks'])
             owner_name=(getattr(self,'settings',None) or {}).get('owner_name','the owner')
-            state=apply_changes(state,changes,source,owner_name,getattr(self,'mirror',None))
+            state=apply_changes(state,changes,source,owner_name,getattr(self,'mirror',None),getattr(self,'route',None))
+            if getattr(self,'people',None): self.apply_route_reply(state,text)
             reply=with_create_signals(state,before_ids,result['reply'])
             state['processed'][key]={'source':name,'time':now(),'changes':len(changes),
                 'clarification':result['clarification_required'],'message_create_time':message.get('createTime')}
@@ -980,6 +1065,37 @@ def sync_tasks_admin():
         generation=runtime.store.save(state,generation)
         return jsonify(status='SUCCESS',changes=(state['coverage'].get('tasks') or {}).get('changes',0))
 
+@app.get('/admin/space-catalog')
+def space_catalog_route():
+    # Owner-only: the routable space catalog (SPACE/GROUP_CHAT, my-ea excluded, no DMs).
+    runtime=Runtime()
+    catalog=runtime.space_catalog()
+    return jsonify(status='OK',count=len(catalog),
+        spaces=[{'space_id':c['space_id'],'name':c['name']} for c in catalog])
+
+@app.get('/admin/route-preview')
+def route_preview():
+    # Owner-only dry run: resolve a non-owner task to a space + pill mention WITHOUT posting.
+    runtime=Runtime(); state,_=runtime.store.get('state.json')
+    task_id=request.args.get('task_id')
+    task=((state or {}).get('tasks') or {}).get(task_id) if task_id else None
+    if not task: return jsonify(status='NO_TASK')
+    if not runtime.people: return jsonify(status='NO_PEOPLE')
+    resolved=routing.resolve_person(runtime.people,task.get('owner'))
+    if resolved=='AMBIGUOUS': return jsonify(status='OWNER_AMBIGUOUS',owner=task.get('owner'))
+    if not resolved: return jsonify(status='OWNER_UNRESOLVED',owner=task.get('owner'))
+    canonical,person=resolved
+    catalog=runtime.space_catalog()
+    names={entry['space_id']:entry['name'] for entry in catalog}
+    space_id,candidates=routing.resolve_space(runtime.model_json,task,catalog)
+    preview={'task_id':task_id,'owner':task.get('owner'),'person':canonical,'catalog_size':len(catalog),
+        'space_id':space_id,'candidates':[{**c,'name':names.get(c['space_id'],'')} for c in candidates]}
+    if space_id:
+        user_id=runtime.member_user_id(space_id,person)
+        preview['user_id_found']=bool(user_id)
+        preview['text']=routing.delivery_text(user_id or '<USER_ID>',task)
+    return jsonify(status='PREVIEW',**preview)
+
 @app.post('/events')
 def events():
     runtime=Runtime(); body=request.get_json(force=True)
@@ -1059,7 +1175,7 @@ def retry_clarification():
         if result['clarification_required']: return jsonify(status='STILL_UNRESOLVED')
         before_ids=set(state['tasks'])
         owner_name=(getattr(runtime,'settings',None) or {}).get('owner_name','the owner')
-        state=apply_changes(state,changes,prior['source'],owner_name,runtime.mirror)
+        state=apply_changes(state,changes,prior['source'],owner_name,runtime.mirror,runtime.route)
         prior_reply=with_create_signals(state,before_ids,result['reply'])
         prior['clarification_required']=False;prior['assistant_reply']=prior_reply;prior['repaired_at']=now()
         if any(c['kind']=='create' for c in changes):

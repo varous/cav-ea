@@ -12,6 +12,9 @@
   "region": "asia-south1",
   "resource_prefix": "ea",
   "tasklist_id": null,
+  "people": {
+    "PERSON_A": {"email": "person.a@example.com", "display_name": "Person A", "aliases": ["A"]}
+  },
   "model": {
     "provider": "deepseek",
     "base_url": "https://api.deepseek.com",

@@ -230,7 +230,7 @@ def explicit_completion(state,message,thread=None):
         'reason':'Explicit owner completion confirmation'+(' resolved in the same thread' if evidence!=message else '')}]}
     return result,evidence+'\n'+message
 
-def apply_changes(state,changes,source,owner_name='the owner',mirror=None):
+def apply_changes(state,changes,source,owner_name='the owner',mirror=None,route=None):
     state=copy.deepcopy(state)
     affected=[]
     for c in changes:
@@ -266,6 +266,16 @@ def apply_changes(state,changes,source,owner_name='the owner',mirror=None):
                 code=str(e) if isinstance(e,RuntimeError) and re.fullmatch(r'[A-Z0-9_]+',str(e)) else type(e).__name__
                 state['tasks'][task_id]['tasks_sync_error']=code
                 print(json.dumps({'status':'TASKS_SYNC_ERROR','code':code,'task_id':task_id,'time':now()}),flush=True)
+    # Route non-owner tasks to their Chat space. Like the mirror, a failure must
+    # never fail the change: record a code-only error and retry next run.
+    if route:
+        for task_id in dict.fromkeys(affected):
+            try:
+                route(state,task_id)
+            except Exception as e:
+                code=str(e) if isinstance(e,RuntimeError) and re.fullmatch(r'[A-Z0-9_]+',str(e)) else type(e).__name__
+                state['tasks'][task_id]['route_error']=code
+                print(json.dumps({'status':'TASKS_DELIVERY_ERROR','code':code,'task_id':task_id,'time':now()}),flush=True)
     return state
 
 def apply_tasks_sync(state,changes,owner_name='the owner'):

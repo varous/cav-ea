@@ -2,7 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py storage.py operating.py attachments.py tasks.py ./
+COPY app.py storage.py operating.py attachments.py tasks.py routing.py ./
 RUN python -c "import app"
 ENV PYTHONUNBUFFERED=1
 USER 65532:65532
