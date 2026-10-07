@@ -69,6 +69,14 @@ class Controls(unittest.TestCase):
         self.assertEqual(updated['tasks']['T-113']['owner'],'PERSON_A')
         self.assertIn('2026-10-06',updated['tasks']['T-113']['deadline'])
         self.assertEqual(updated['tasks']['T-113']['status'],'OUTSTANDING')
+    def test_authority_uses_owner_display_name(self):
+        state=import_ledger(BASE);text='Add a follow-up with PERSON_M to my list'
+        change={'kind':'create','task_id':None,'field':'title','value':'Follow up with PERSON_M','evidence_quote':text,'reason':'New owner to-do','new_task':{'owner':'NOT YET ASSIGNED','deadline':'UNKNOWN','priority':'UNKNOWN','details':''}}
+        changes=validate_changes(state,{'clarification_required':False,'changes':[change]},text)
+        named=apply_changes(state,changes,'owner message','Alex Example')
+        self.assertEqual(named['changes'][-1]['authority'],'confirmed/instructed by Alex Example')
+        generic=apply_changes(state,changes,'owner message')
+        self.assertEqual(generic['changes'][-1]['authority'],'confirmed/instructed by the owner')
     def test_shorthand_clarification_resolves_111b(self):
         state=import_ledger(BASE)
         for text in ('it meant 111B','PERSON_D tickets online update meant 111B, 111A remains as is'):

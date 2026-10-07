@@ -668,7 +668,8 @@ class Runtime:
                 continue
             source='https://chat.google.com/room/'+self.space.split('/')[1]+' — '+name
             before_ids=set(state['tasks'])
-            state=apply_changes(state,changes,source)
+            owner_name=(getattr(self,'settings',None) or {}).get('owner_name','the owner')
+            state=apply_changes(state,changes,source,owner_name)
             reply=with_create_signals(state,before_ids,result['reply'])
             state['processed'][key]={'source':name,'time':now(),'changes':len(changes),
                 'clarification':result['clarification_required'],'message_create_time':message.get('createTime')}
@@ -963,7 +964,8 @@ def retry_clarification():
         changes=validate_changes(state,result,evidence)
         if result['clarification_required']: return jsonify(status='STILL_UNRESOLVED')
         before_ids=set(state['tasks'])
-        state=apply_changes(state,changes,prior['source'])
+        owner_name=(getattr(runtime,'settings',None) or {}).get('owner_name','the owner')
+        state=apply_changes(state,changes,prior['source'],owner_name)
         prior_reply=with_create_signals(state,before_ids,result['reply'])
         prior['clarification_required']=False;prior['assistant_reply']=prior_reply;prior['repaired_at']=now()
         if any(c['kind']=='create' for c in changes):

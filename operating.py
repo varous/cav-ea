@@ -229,7 +229,7 @@ def explicit_completion(state,message,thread=None):
         'reason':'Explicit owner completion confirmation'+(' resolved in the same thread' if evidence!=message else '')}]}
     return result,evidence+'\n'+message
 
-def apply_changes(state,changes,source):
+def apply_changes(state,changes,source,owner_name='the owner'):
     state=copy.deepcopy(state)
     for c in changes:
         old=None; task_id=c['task_id']
@@ -248,7 +248,7 @@ def apply_changes(state,changes,source):
         commit=state['baseline_commit']+len(state['changes'])+1
         state['changes'].append({'commit':f'C-{commit:03d}','time':now(),'kind':c['kind'],
             'task_id':task_id,'field':c['field'],'old':old,'new':c['value'],'reason':c['reason'],
-            'evidence_quote':c['evidence_quote'],'authority':'confirmed/instructed by PERSON_A',
+            'evidence_quote':c['evidence_quote'],'authority':'confirmed/instructed by '+owner_name,
             'source':source,'validation':state['mode']!='active'})
     return state
 
