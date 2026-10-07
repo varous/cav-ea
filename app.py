@@ -607,7 +607,10 @@ class Runtime:
         spaces=list(pages(self.user,CHAT+'spaces','spaces',{'pageSize':1000}))
         return routing.build_catalog(spaces,exclude_ids=[self.space])
     def member_user_id(self,space_id,person):
-        members=list(pages(self.user,CHAT+space_id+'/members','memberships',{'pageSize':1000}))
+        try:
+            members=list(pages(self.user,CHAT+space_id+'/members','memberships',{'pageSize':1000}))
+        except Exception:
+            return None
         return routing.member_user_id(members,person)
     def model_json(self,system,user): return complete_with_headroom(system,user)
     def post_to_space(self,space_id,text,message_id,key):
@@ -630,14 +633,17 @@ class Runtime:
         for index,candidate in enumerate(candidates,1):
             lines.append(f"{index}. {candidate.get('name') or candidate['space_id']}")
         add_outbox(state,self.space,'route-ask:'+task['id'],'\n'.join(lines))
-    def deliver_route(self,state,task,person,space_id):
-        user_id=self.member_user_id(space_id,person)
-        if not user_id:
-            task['route_status']='unresolved_member'; task['route_space_id']=space_id; task['route_error']='MEMBER_NOT_FOUND'; return
-        message_id='client-cw-route-'+digest(task['id'])[:40]
-        receipt=self.post_to_space(space_id,routing.delivery_text(user_id,task),message_id,'route:'+task['id'])
-        task['route_space_id']=space_id; task['route_message_id']=receipt
-        task['route_status']='delivered'; task['route_delivered']=now(); task.pop('route_error',None)
+    def deliver_route(self,state,task,person,space_ids):
+        # Choose the first candidate space the person actually belongs to.
+        for space_id in space_ids:
+            user_id=self.member_user_id(space_id,person)
+            if not user_id: continue
+            message_id='client-cw-route-'+digest(task['id'])[:40]
+            receipt=self.post_to_space(space_id,routing.delivery_text(user_id,task),message_id,'route:'+task['id'])
+            task['route_space_id']=space_id; task['route_message_id']=receipt
+            task['route_status']='delivered'; task['route_delivered']=now(); task.pop('route_error',None)
+            return True
+        task['route_status']='unresolved_member'; task['route_error']='MEMBER_NOT_FOUND'; return False
     def route(self,state,task_id):
         """Route a non-owner task to its Chat space; never raises through apply_changes."""
         task=state['tasks'].get(task_id)
@@ -658,7 +664,7 @@ class Runtime:
         if not space_id:
             task['route_status']='awaiting'; task['route_candidates']=candidates
             self.ask_route_space(state,task,candidates); return
-        self.deliver_route(state,task,person,space_id)
+        self.deliver_route(state,task,person,[space_id]+[c['space_id'] for c in candidates])
     def pick_space(self,text,candidates):
         normalized=routing.normalize(text)
         for index,candidate in enumerate(candidates or [],1):
@@ -675,7 +681,7 @@ class Runtime:
             resolved=routing.resolve_person(self.people,task.get('owner'))
             if not resolved or resolved=='AMBIGUOUS': continue
             _,person=resolved
-            self.deliver_route(state,task,person,space_id)
+            self.deliver_route(state,task,person,[space_id])
     def route_pending(self,state):
         for task_id,task in list(state['tasks'].items()):
             if task.get('route_status') in ('delivered','awaiting'): continue
@@ -1091,9 +1097,13 @@ def route_preview():
     preview={'task_id':task_id,'owner':task.get('owner'),'person':canonical,'catalog_size':len(catalog),
         'space_id':space_id,'candidates':[{**c,'name':names.get(c['space_id'],'')} for c in candidates]}
     if space_id:
-        user_id=runtime.member_user_id(space_id,person)
-        preview['user_id_found']=bool(user_id)
-        preview['text']=routing.delivery_text(user_id or '<USER_ID>',task)
+        ordered=[space_id]+[c['space_id'] for c in candidates]
+        ids={sid:runtime.member_user_id(sid,person) for sid in ordered}
+        preview['member_in']={sid:bool(uid) for sid,uid in ids.items()}
+        chosen=next((sid for sid in ordered if ids.get(sid)),None)
+        if chosen:
+            preview['resolved_space_id']=chosen
+            preview['text']=routing.delivery_text(ids[chosen],task)
     return jsonify(status='PREVIEW',**preview)
 
 @app.post('/events')
