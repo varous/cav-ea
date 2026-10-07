@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!requirements.txt
+!collector.py
+!drive_delivery.py
+!cloud_runner.py
+!verify_replay.py
+!.gcloudignore

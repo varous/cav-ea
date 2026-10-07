@@ -172,5 +172,71 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("jobs", data)
 
 
+class CollectorTests(unittest.TestCase):
+    def test_core_only_by_default(self):
+        s = settings()
+        steps = Provisioner(s, Shell(s, dry_run=True)).execute()
+        self.assertFalse(any(step.kind == "job" for step in steps))
+        self.assertNotIn(s.collector_job, flattened(steps))
+
+    def test_with_collector_adds_job_scheduler_and_secrets(self):
+        s = settings()
+        steps = Provisioner(s, Shell(s, dry_run=True), with_collector=True).execute()
+        blob = flattened(steps)
+        self.assertIn(s.collector_job, blob)
+        self.assertIn(s.collector_scheduler, blob)
+        self.assertIn(s.collector_chat_secret, blob)
+        self.assertIn(s.collector_drive_secret, blob)
+        self.assertEqual(len([step for step in steps if step.kind == "job"]), 1)
+        job = [step for step in steps if step.kind == "job"][0]
+        self.assertIn("--source", job.argv)
+        self.assertIn("collector/", job.argv)
+        self.assertTrue(any("COLLECTOR_STATE_BUCKET=" in part for part in job.argv))
+        for token in denylist():
+            self.assertNotIn(token.lower(), blob.lower())
+
+
+class TeardownTests(unittest.TestCase):
+    def test_teardown_removes_delivery_and_keeps_buckets(self):
+        s = settings()
+        provisioner = Provisioner(s, Shell(s, dry_run=True))
+        steps = provisioner.execute(steps=provisioner.plan_teardown())
+        kinds = {step.kind for step in steps}
+        self.assertIn("service", kinds)
+        self.assertIn("subscription", kinds)
+        self.assertIn("scheduler", kinds)
+        self.assertNotIn("bucket", kinds)
+        self.assertFalse(any(step.kind == "secret" for step in steps))
+        for token in denylist():
+            self.assertNotIn(token.lower(), flattened(steps).lower())
+
+    def test_teardown_purge_removes_secrets_topics_sas_not_buckets(self):
+        s = settings()
+        provisioner = Provisioner(s, Shell(s, dry_run=True))
+        steps = provisioner.execute(steps=provisioner.plan_teardown(purge=True))
+        kinds = {step.kind for step in steps}
+        self.assertIn("secret", kinds)
+        self.assertIn("topic", kinds)
+        self.assertIn("sa", kinds)
+        self.assertNotIn("bucket", kinds)
+
+    def test_teardown_is_idempotent_for_absent_resources(self):
+        s = settings()
+        absent = Provisioner(s, Shell(s, dry_run=True))
+        steps = absent.execute(steps=absent.plan_teardown())
+        self.assertTrue(steps and all(step.skip for step in steps))
+
+        present = Provisioner(s, Shell(s, dry_run=True, existing={("service", s.service_name)}))
+        steps = present.execute(steps=present.plan_teardown())
+        service_steps = [step for step in steps if step.kind == "service"]
+        self.assertTrue(service_steps and not service_steps[0].skip)
+
+    def test_teardown_with_collector_removes_job(self):
+        s = settings()
+        provisioner = Provisioner(s, Shell(s, dry_run=True), with_collector=True)
+        steps = provisioner.execute(steps=provisioner.plan_teardown())
+        self.assertIn(s.collector_job, flattened(steps))
+
+
 if __name__ == "__main__":
     unittest.main()

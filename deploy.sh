@@ -10,6 +10,10 @@ case "${1:-}" in
     shift
     exec python3 bootstrap.py "$@"
     ;;
+  teardown)
+    shift
+    exec python3 bootstrap.py --teardown "$@"
+    ;;
   --dry-run)
     shift
     exec python3 bootstrap.py --dry-run "$@"
@@ -17,11 +21,13 @@ case "${1:-}" in
   ""|-h|--help|help)
     cat <<'EOF'
 usage:
-  ./deploy.sh up [--dry-run] [--config FILE] [--secret-file NAME=PATH]
+  ./deploy.sh up [--dry-run] [--config FILE] [--secret-file NAME=PATH] [--with-collector]
+  ./deploy.sh teardown [--dry-run] [--with-collector] [--purge]
   ./deploy.sh --dry-run [options]
 
-Provisions the operating assistant (Cloud Run, Pub/Sub, secrets, schedulers).
-Requires an authenticated gcloud. See README "Setup" for the walkthrough.
+Provisions (up) or removes (teardown) the operating assistant: Cloud Run, Pub/Sub,
+secrets, schedulers, and optionally the read-only collector. Requires an
+authenticated gcloud. See README "Setup" for the walkthrough.
 EOF
     ;;
   *)

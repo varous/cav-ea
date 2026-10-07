@@ -13,6 +13,9 @@ config.json
 knowledge/
 state.json
 .env
+*.db
+*token*.json
+*credentials*.json
 
 # OS
 .DS_Store

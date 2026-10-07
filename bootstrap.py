@@ -201,6 +201,31 @@ class Settings:
         number = self.project_number or "<PROJECT_NUMBER>"
         return f"https://{self.service_name}-{number}.{self.region}.run.app"
 
+    # -- optional collector component -------------------------------------
+    @property
+    def collector_job(self):
+        return f"{self.prefix}-collector"
+
+    @property
+    def collector_scheduler(self):
+        return f"{self.prefix}-collector-hourly"
+
+    @property
+    def collector_runtime_sa(self):
+        return f"{self.prefix}-collector-runtime@{self.project}.iam.gserviceaccount.com"
+
+    @property
+    def collector_trigger_sa(self):
+        return f"{self.prefix}-collector-trigger@{self.project}.iam.gserviceaccount.com"
+
+    @property
+    def collector_chat_secret(self):
+        return f"{self.prefix}-collector-chat-oauth"
+
+    @property
+    def collector_drive_secret(self):
+        return f"{self.prefix}-collector-drive-oauth"
+
 
 def _read_json(path):
     with open(path, encoding="utf-8") as handle:
@@ -337,6 +362,7 @@ class Shell:
             "sa": ["gcloud", "iam", "service-accounts", "describe", name, project],
             "secret": ["gcloud", "secrets", "describe", name, project],
             "service": ["gcloud", "run", "services", "describe", name, "--region=" + settings.region, project],
+            "job": ["gcloud", "run", "jobs", "describe", name, "--region=" + settings.region, project],
             "topic": ["gcloud", "pubsub", "topics", "describe", name, project],
             "subscription": ["gcloud", "pubsub", "subscriptions", "describe", name, project],
             "scheduler": ["gcloud", "scheduler", "jobs", "describe", name, "--location=" + settings.region, project],
@@ -374,22 +400,28 @@ class Step:
     probe: bool = False
     skip: bool = False
     note: str = ""
+    when_exists: bool = False  # True for deletes: run only when the resource is present
 
 
 class Provisioner:
-    def __init__(self, settings, shell, idempotent=True, secret_files=None, baseline=None):
+    def __init__(self, settings, shell, idempotent=True, secret_files=None, baseline=None,
+                 with_collector=False):
         self.settings = settings
         self.shell = shell
         self.idempotent = idempotent
         self.secret_files = list(secret_files or [])
         self.baseline = baseline
+        self.with_collector = with_collector
 
-    def execute(self):
-        steps = self.plan()
+    def execute(self, steps=None):
+        steps = self.plan() if steps is None else steps
         for step in steps:
-            if self.idempotent and step.probe and self.shell.exists(step.kind, step.name):
-                step.skip = True
-                continue
+            if self.idempotent and step.probe:
+                present = self.shell.exists(step.kind, step.name)
+                if present != step.when_exists:
+                    # create: skip when present; delete: skip when absent
+                    step.skip = True
+                    continue
             self.shell.run(step.argv)
         return steps
 
@@ -551,7 +583,124 @@ class Provisioner:
                 "gcloud", "secrets", "versions", "add", secret,
                 "--data-file=" + path, project, "--quiet",
             ])
+
+        # 19. Optional collector component (read-only Chat intake)
+        if self.with_collector:
+            for name, display in (
+                (s.prefix + "-collector-runtime", "Collector runtime"),
+                (s.prefix + "-collector-trigger", "Collector trigger"),
+            ):
+                add("sa", name, [
+                    "gcloud", "iam", "service-accounts", "create", name,
+                    "--display-name=" + display, project, "--quiet",
+                ], probe=True)
+            for secret in (s.collector_chat_secret, s.collector_drive_secret):
+                add("secret", secret, [
+                    "gcloud", "secrets", "create", secret,
+                    "--replication-policy=automatic", project, "--quiet",
+                ], probe=True)
+                add("secret-iam", secret, [
+                    "gcloud", "secrets", "add-iam-policy-binding", secret,
+                    "--member=serviceAccount:" + s.collector_runtime_sa,
+                    "--role=roles/secretmanager.secretAccessor", project, "--quiet",
+                ])
+            add("bucket-iam", s.chat_state_bucket + "::collector", [
+                "gcloud", "storage", "buckets", "add-iam-policy-binding", "gs://" + s.chat_state_bucket,
+                "--member=serviceAccount:" + s.collector_runtime_sa,
+                "--role=roles/storage.objectAdmin", project, "--quiet",
+            ])
+            add("job", s.collector_job, self._collector_argv(), probe=True)
+            add("job-iam", s.collector_job + "::trigger", [
+                "gcloud", "run", "jobs", "add-iam-policy-binding", s.collector_job,
+                "--member=serviceAccount:" + s.collector_trigger_sa,
+                "--role=roles/run.invoker", "--region=" + s.region, project, "--quiet",
+            ])
+            add("scheduler", s.collector_scheduler, [
+                "gcloud", "scheduler", "jobs", "create", "http", s.collector_scheduler,
+                "--schedule=0 * * * *", "--time-zone=" + s.timezone,
+                "--uri=" + self._collector_run_url(), "--http-method=POST",
+                "--oauth-service-account-email=" + s.collector_trigger_sa,
+                "--location=" + s.region, project, "--quiet",
+            ], probe=True)
         return steps
+
+    def plan_teardown(self, purge=False):
+        """Reverse of plan(): pause/remove delivery, then optionally purge secrets/topics/SAs.
+
+        State buckets and exports are always retained for audit. Deletes are probed,
+        so an already-absent resource is skipped (idempotent).
+        """
+        s = self.settings
+        project = "--project=" + s.project
+        steps = []
+
+        def add(kind, name, argv, probe=False, note=""):
+            steps.append(Step(kind, name, argv, probe=probe, note=note, when_exists=True))
+
+        scheduler_names = [s.prefix + "-" + suffix for suffix, _, _ in SCHEDULES]
+        if self.with_collector:
+            scheduler_names.append(s.collector_scheduler)
+        for name in scheduler_names:
+            add("scheduler", name, ["gcloud", "scheduler", "jobs", "pause", name,
+                                     "--location=" + s.region, project, "--quiet"], probe=True)
+            add("scheduler", name, ["gcloud", "scheduler", "jobs", "delete", name,
+                                     "--location=" + s.region, project, "--quiet"], probe=True)
+
+        for sub in (s.events_sub, s.work_sub):
+            add("subscription", sub, ["gcloud", "pubsub", "subscriptions", "delete", sub,
+                                       project, "--quiet"], probe=True)
+
+        add("service", s.service_name, ["gcloud", "run", "services", "delete", s.service_name,
+                                         "--region=" + s.region, project, "--quiet"], probe=True)
+        if self.with_collector:
+            add("job", s.collector_job, ["gcloud", "run", "jobs", "delete", s.collector_job,
+                                          "--region=" + s.region, project, "--quiet"], probe=True)
+
+        if purge:
+            for topic in (s.events_topic, s.work_topic):
+                add("topic", topic, ["gcloud", "pubsub", "topics", "delete", topic,
+                                      project, "--quiet"], probe=True)
+            secrets = [s.model_secret, s.chat_secret, s.gmail_secret]
+            if self.with_collector:
+                secrets += [s.collector_chat_secret, s.collector_drive_secret]
+            for secret in secrets:
+                add("secret", secret, ["gcloud", "secrets", "delete", secret,
+                                        project, "--quiet"], probe=True)
+            service_accounts = [s.runtime_sa, s.trigger_sa]
+            if self.with_collector:
+                service_accounts += [s.collector_runtime_sa, s.collector_trigger_sa]
+            for service_account in service_accounts:
+                add("sa", service_account, ["gcloud", "iam", "service-accounts", "delete",
+                                             service_account, project, "--quiet"], probe=True)
+        return steps
+
+    def _collector_argv(self):
+        s = self.settings
+        env = {
+            "COLLECTOR_RUNTIME": "/tmp/ea-collector",
+            "COLLECTOR_STATE_BUCKET": s.chat_state_bucket,
+            "OWNER_EMAIL": s.owner_email,
+            "COLLECTOR_FOLDER_NAME": "Chat intake",
+        }
+        env_vars = ",".join(f"{k}={v}" for k, v in env.items())
+        secrets = ",".join([
+            f"COLLECTOR_CHAT_SECRET={s.collector_chat_secret}:latest",
+            f"COLLECTOR_DRIVE_SECRET={s.collector_drive_secret}:latest",
+        ])
+        return [
+            "gcloud", "run", "jobs", "deploy", s.collector_job,
+            "--source", "collector/", "--region=" + s.region, "--project=" + s.project,
+            "--service-account=" + s.collector_runtime_sa,
+            "--tasks=1", "--parallelism=1", "--max-retries=1", "--task-timeout=2400",
+            "--set-env-vars=" + env_vars, "--set-secrets=" + secrets, "--quiet",
+        ]
+
+    def _collector_run_url(self):
+        s = self.settings
+        return (
+            f"https://{s.region}-run.googleapis.com/apis/run.googleapis.com/v1/"
+            f"namespaces/{s.project}/jobs/{s.collector_job}:run"
+        )
 
     def _events_body(self):
         s = self.settings
@@ -612,12 +761,18 @@ def generate_state(baseline_path, out="state.json"):
     return out
 
 
-def manual_steps(settings):
+def manual_steps(settings, with_collector=False):
     """Things a deployer must do by hand; identity/consent can't be automated."""
-    return [
+    steps = []
+    if with_collector:
+        steps.append(
+            "Collector grants: run scripts/oauth_setup.py for the chat and drive "
+            "secrets (scopes chat.spaces.readonly/chat.messages.readonly and drive.file)."
+        )
+    steps += [
         "Create a Desktop OAuth client for the owner Google account, complete the "
         "consent flow once, and store the resulting user JSON in the chat-oauth "
-        "secret (never commit it).",
+        "secret (never commit it). Use scripts/oauth_setup.py to automate this step.",
         "If Gmail intake is wanted, store the Gmail read-only user JSON in the "
         "gmail-oauth secret the same way.",
         "Add secret values without echoing them: "
@@ -630,6 +785,7 @@ def manual_steps(settings):
         "Authorize the owner for the Workspace Events API and confirm the "
         "subscription reaches the /events push endpoint.",
     ]
+    return steps
 
 
 def render_steps(steps):
@@ -678,6 +834,14 @@ def parse_args(argv):
     parser.add_argument("--secret-file", action="append", default=[], metavar="NAME=PATH",
                         help="add a secret version from a file; NAME is model|chat|gmail or the secret name")
     parser.add_argument("--baseline", default=None, help="optional ledger baseline to initialize state from")
+    parser.add_argument("--with-collector", dest="with_collector", action="store_true", default=False,
+                        help="also provision the optional read-only collector job + scheduler")
+    parser.add_argument("--without-collector", dest="with_collector", action="store_false",
+                        help="core only (default)")
+    parser.add_argument("--teardown", action="store_true", help="remove provisioned resources")
+    parser.add_argument("--purge", action="store_true",
+                        help="teardown also deletes secrets, topics and service accounts "
+                             "(state buckets are always retained)")
     parser.add_argument("--write-config", default="config.json",
                         help="where to write config.json (live mode)")
     parser.add_argument("--print-config", action="store_true", help="print the generated config")
@@ -703,18 +867,29 @@ def main(argv=None):
     }
     settings = load_settings(args.config, overrides=overrides)
     config = build_config(settings)
-    if not args.dry_run:
+    if not args.dry_run and not args.teardown:
         validate_config(config)
 
     shell = Shell(settings, dry_run=args.dry_run)
     provisioner = Provisioner(settings, shell, idempotent=args.idempotent,
-                              secret_files=args.secret_file, baseline=args.baseline)
-    if not args.dry_run and args.baseline:
-        generate_state(args.baseline)
-    steps = provisioner.execute()
+                              secret_files=args.secret_file, baseline=args.baseline,
+                              with_collector=args.with_collector)
+    if args.teardown:
+        steps = provisioner.execute(steps=provisioner.plan_teardown(purge=args.purge))
+    else:
+        if not args.dry_run and args.baseline:
+            generate_state(args.baseline)
+        steps = provisioner.execute()
     if not args.quiet:
         print(render_steps(steps))
     assert_no_reserved(render_steps(steps))
+
+    if args.teardown:
+        print("\n# teardown: state buckets and exports retained for audit"
+              + (" (purge removed secrets/topics/service accounts)" if args.purge else ""))
+        if args.dry_run:
+            print("# dry-run: no resources changed")
+        return 0
 
     if args.dry_run:
         print("\n# dry-run: no resources changed")
@@ -725,7 +900,7 @@ def main(argv=None):
         print(json.dumps(config, indent=2))
 
     print("\n# manual steps (cannot be fully automated):")
-    for line in manual_steps(settings):
+    for line in manual_steps(settings, with_collector=args.with_collector):
         print("# - " + line)
     return 0
 

@@ -16,73 +16,74 @@ operational data, credentials, or deployment-specific identifiers.
 - **Briefs** — a Python-computed changelog every hour plus a pending recap at recap hours.
 - **Knowledge pack** — a deployer-supplied bundle (operating context, optional people, optional
   documents) retrieved through a single pluggable interface (`retrieve_relevant`).
+- **Optional collector** — a read-only Google Chat intake pipeline (Cloud Run job) that stores raw
+  records durably and can feed the assistant's context.
 - **Model-call resilience** — per-message fail-closed, telemetry, and a bounded reasoning budget.
 
 ## Layout
 
 ```
-app.py                  HTTP service: routes, model call, chat/Gmail intake, recovery, briefs
-operating.py            operating rules (templated), validation, change application, ledger export
-storage.py              generation-fenced private object storage + execution lease
-attachments.py          Chat attachment ingestion/extraction
-bootstrap.py            parameterized provisioner (dry-run + idempotent)
-deploy.sh               thin wrapper: ./deploy.sh up | ./deploy.sh --dry-run
-test_controls.py        control/integration tests (fixture-driven)
-test_attachments.py     attachment tests
-test_deepseek.py        model-call tests
-test_bootstrap.py       provisioner tests (no network/cloud)
-fixtures/baseline.md    neutral test baseline (no real data)
-config.example.json     example deployment config (config.json)
-.env.example            documented environment overrides
-requirements.txt        runtime dependencies
-requirements-dev.txt    test-only dependencies (PyYAML)
-docs/knowledge-pack.md  retrieval + knowledge-pack interface contract (the RAG seam)
-.github/workflows/ci.yml  CI: python -m unittest discover on push + PR
+app.py                   HTTP service: routes, model call, chat/Gmail intake, recovery, briefs
+operating.py             operating rules (templated), validation, change application, ledger export
+storage.py               generation-fenced private object storage + execution lease
+attachments.py           Chat attachment ingestion/extraction
+bootstrap.py             parameterized provisioner: up + teardown, dry-run + idempotent
+deploy.sh                thin wrapper: up | teardown | --dry-run
+collector/               optional read-only Chat collector (job + scheduler); own Dockerfile/runbook
+scripts/oauth_setup.py   scripted owner OAuth walkthrough (stores secrets without printing tokens)
+test_controls.py         control/integration tests (fixture-driven)
+test_attachments.py      attachment tests
+test_deepseek.py         model-call tests
+test_bootstrap.py        provisioner + teardown tests (no network/cloud)
+test_collector.py        collector tests (no network)
+test_oauth_setup.py      OAuth-script tests (no browser)
+fixtures/baseline.md     neutral test baseline (no real data)
+config.example.json      example deployment config (config.json)
+.env.example             documented environment overrides
+requirements.txt         runtime dependencies
+requirements-dev.txt     test-only dependencies (PyYAML)
+docs/knowledge-pack.md   retrieval + knowledge-pack interface contract (the RAG seam)
+docs/clean-room.md       checklist for a throwaway-project proving run
+.github/workflows/ci.yml CI: python -m unittest discover on push + PR
 ```
 
-## Setup
+## Quickstart
 
 Prerequisites:
 
-- `gcloud` installed and authenticated as an account with permission to create Cloud Run, Pub/Sub,
+- `gcloud` installed and authenticated as an account that can create Cloud Run, Pub/Sub,
   Secret Manager, service accounts and Scheduler jobs in the target project.
 - Python 3.11+ available locally.
 - A Google Chat space where the owner and the assistant's bot are both members.
 
-Provision everything in one command:
+1. **Configure.** Edit `config.example.json` (or pass flags / env). Required identity:
+   `owner_email`, `owner_user`, `space_id`, `bot_id`. Preview the plan first:
 
-```sh
-./deploy.sh up            # real, idempotent provisioning
-./deploy.sh --dry-run     # print every command; change nothing
-```
+   ```sh
+   ./deploy.sh --dry-run          # prints every command, changes nothing
+   ```
 
-`bootstrap.py` is parameterized entirely by `config.json`, `.env` and CLI flags (project, region,
-owner identity, space, bot, resource prefix, buckets, model block, recap hours). It:
+2. **Provision.**
 
-1. Enables the required APIs.
-2. Creates the state + chat-state buckets.
-3. Creates the runtime and trigger service accounts with least-privilege roles.
-4. Creates the model/chat/gmail secrets and prompts you to add values (never echoed).
-5. Builds and deploys the assistant **privately** and limits invokers to the owner and trigger.
-6. Creates the Pub/Sub topics and authenticated push subscriptions (`/events`, `/process`).
-7. Creates the Workspace Events subscription for the space (message-created, resource names only).
-8. Creates the schedulers (intake `:07`, renew `:15`, briefs `09:00`, briefs `10–22 Mon–Sat`) with
-   OIDC auth to the trigger service account.
-9. Writes `config.json` and uploads it to the state bucket.
+   ```sh
+   ./deploy.sh up                 # core assistant (idempotent)
+   ./deploy.sh up --with-collector   # also the optional read-only chat collector
+   ```
 
-Useful flags: `--project`, `--region`, `--prefix`, `--owner-email`, `--owner-user`, `--space-id`,
-`--bot-id`, `--project-number`, `--service-url`, `--secret-file NAME=PATH` (add a secret version from a
-file), `--baseline FILE` (seed the ledger state), `--print-config`, `--no-idempotent`.
+3. **OAuth.** The owner's browser consent is the one unavoidable manual step:
 
-### Manual steps
+   ```sh
+   python scripts/oauth_setup.py --kind chat  --secret <prefix>-chat-oauth  --client client.json --project <project>
+   python scripts/oauth_setup.py --kind gmail --secret <prefix>-gmail-oauth --client client.json --project <project>
+   # with --with-collector:
+   python scripts/oauth_setup.py --kind chat  --secret <prefix>-collector-chat-oauth  --client client.json --project <project>
+   python scripts/oauth_setup.py --kind drive --secret <prefix>-collector-drive-oauth --client client.json --project <project>
+   ```
 
-Two things cannot be fully automated and must be done by you:
+   The script prints the exact Console steps, runs the Desktop consent flow, and stores the user JSON
+   in Secret Manager **without printing any token**.
 
-1. **OAuth consent** — create a Desktop OAuth client for the owner account, complete the consent once,
-   and store the resulting user JSON in the `chat-oauth` secret (and `gmail-oauth` if you want Gmail
-   intake). Never commit these files.
-2. **Workspace Events publisher grant** — allow the Workspace Events service to publish to the events
-   topic:
+4. **Grant the Workspace Events publisher** on the events topic (the one remaining manual grant):
 
    ```sh
    gcloud pubsub topics add-iam-policy-binding <prefix>-events \
@@ -90,13 +91,38 @@ Two things cannot be fully automated and must be done by you:
      --role=roles/pubsub.publisher --project=<project>
    ```
 
-Then authorize the owner for the Workspace Events API and confirm the subscription reaches `/events`.
+5. **Verify.** Call the private service with an identity token:
+
+   ```sh
+   gcloud auth print-identity-token | xargs -I{} curl -s -H "Authorization: Bearer {}" https://<service>/health
+   python scripts/oauth_setup.py --kind chat --verify-url https://<service>/maintain   # one renewal
+   ```
+
+   Then confirm one `/intake`, one delivered `/brief`, and a healthy `/maintain` renewal. See
+   `docs/clean-room.md` for the full throwaway-project checklist.
+
+6. **Teardown.** Removes schedulers, subscriptions, the service (and job), and is idempotent:
+
+   ```sh
+   ./deploy.sh teardown --dry-run
+   ./deploy.sh teardown --with-collector          # keep state + exports for audit
+   ./deploy.sh teardown --purge                   # also remove secrets, topics and SAs
+   ```
+
+   State buckets and exports are always retained.
 
 ## Configuration
 
 Identity and behaviour come from `config.json` (in the state bucket) plus documented environment
-overrides. See `config.example.json` and `.env.example`. Required identity: `owner_email`,
-`owner_user`, `space_id`, `bot_id`.
+overrides. See `config.example.json` and `.env.example`. Defaults keep the core lean; the collector is
+opt-in.
+
+## Collector (optional)
+
+The `collector/` component lists the conversations the owner account belongs to, stores raw message
+records durably (deduplicated by resource name), and delivers immutable Markdown batches to a Drive
+folder. It is read-only: no send, reply, delete or read-state operation exists. See
+`collector/RUNBOOK.md`.
 
 ## Knowledge pack / retrieval
 
