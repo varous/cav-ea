@@ -265,13 +265,13 @@ class AskFlow(unittest.TestCase):
         self.assertEqual(state["tasks"]["T-9"]["route_ask_count"], 1)
         self.assertEqual(len(state["outbox"]), 1)
 
-    def test_unknown_reasks(self):
+    def test_unknown_does_not_reask(self):
         r = self.runtime()
         r.space_catalog = lambda: [{"space_id": "S1", "name": "Ops", "context": ""}]
         state = {"tasks": {"T-9": {**self.task(), "route_status": "awaiting", "route_candidates": []}}, "outbox": {}}
         r.apply_route_reply(state, "nowhere at all")
-        self.assertEqual(state["tasks"]["T-9"]["route_ask_count"], 1)
-        self.assertIn("exact group name", list(state["outbox"].values())[0]["text"])
+        self.assertEqual(state["tasks"]["T-9"].get("route_ask_count", 0), 0)
+        self.assertEqual(len(state["outbox"]), 0)
 
     def test_member_not_found_notifies_owner(self):
         r = self.runtime()
@@ -281,6 +281,75 @@ class AskFlow(unittest.TestCase):
         r.apply_route_reply(state, "Stage")
         self.assertEqual(state["tasks"]["T-9"]["route_status"], "unresolved_member")
         self.assertIn("couldn't find", list(state["outbox"].values())[0]["text"])
+
+    def test_create_asks_exactly_once(self):
+        r = self.runtime()
+        r.space_catalog = lambda: [{"space_id": "S1", "name": "Ops", "context": ""}]
+        r.model_json = lambda s, u: {"space_id": "S1", "candidates": []}
+        state = {"tasks": {"T-9": self.task()}, "outbox": {}}
+        r.route(state, "T-9")                                          # create -> one ask
+        r.apply_route_reply(state, "Assign a demo task to Joyjeet")    # the create message itself
+        self.assertEqual(len(state["outbox"]), 1)
+        self.assertEqual(state["tasks"]["T-9"]["route_status"], "awaiting")
+
+    def test_unrelated_message_does_not_reask(self):
+        r = self.runtime()
+        r.space_catalog = lambda: [{"space_id": "S1", "name": "Ops", "context": ""}]
+        state = {"tasks": {"T-9": {**self.task(), "route_status": "awaiting", "route_candidates": []}}, "outbox": {}}
+        r.apply_route_reply(state, "Please review the quarterly numbers for the event and budget before Friday")
+        self.assertEqual(len(state["outbox"]), 0)
+
+    def test_post_403_notifies_and_does_not_raise(self):
+        r = self.runtime()
+        r.space_catalog = lambda: [{"space_id": "spaces/S1", "name": "Stage", "context": ""}]
+        r.member_user_id = lambda space, person: "42"
+
+        def boom(space, text, mid, key):
+            raise RuntimeError("GOOGLE_HTTP_403")
+
+        r.post_to_space = boom
+        state = {"tasks": {"T-9": {**self.task(), "route_status": "awaiting", "route_candidates": []}}, "outbox": {}}
+        r.apply_route_reply(state, "Stage")
+        task = state["tasks"]["T-9"]
+        self.assertEqual(task["route_status"], "error")
+        self.assertEqual(task["route_error"], "GOOGLE_HTTP_403")
+        self.assertIn("is the bot a member", list(state["outbox"].values())[0]["text"])
+
+
+class CatalogExclude(unittest.TestCase):
+    SPACES = [{"name": "spaces/T1", "displayName": "test_taskbot", "spaceType": "SPACE"},
+              {"name": "spaces/T2", "displayName": "Bot_tests", "spaceType": "GROUP_CHAT"},
+              {"name": "spaces/T3", "displayName": "Demo Space", "spaceType": "SPACE"},
+              {"name": "spaces/G1", "displayName": "general-team-room", "spaceType": "SPACE"},
+              {"name": "spaces/O1", "displayName": "ops-room", "spaceType": "SPACE"}]
+
+    def test_default_pattern_excludes_test_bot_demo(self):
+        ids = [entry["space_id"] for entry in routing.build_catalog(self.SPACES)]
+        self.assertNotIn("spaces/T1", ids)
+        self.assertNotIn("spaces/T2", ids)
+        self.assertNotIn("spaces/T3", ids)
+        self.assertIn("spaces/O1", ids)
+
+    def test_config_pattern_and_id_excludes(self):
+        by_pattern = [e["space_id"] for e in routing.build_catalog(self.SPACES, exclude={"patterns": ["general-team-room"]})]
+        self.assertNotIn("spaces/G1", by_pattern)
+        by_id = [e["space_id"] for e in routing.build_catalog(self.SPACES, exclude={"ids": ["spaces/O1"]})]
+        self.assertNotIn("spaces/O1", by_id)
+
+
+class ReplyContext(unittest.TestCase):
+    def test_route_fields_absent_from_reply_context(self):
+        from app import tasks_for_context
+        s = import_ledger(LEDGER)
+        s["tasks"]["T-101"].update({"route_status": "awaiting", "route_candidates": [{"space_id": "x"}],
+                                    "route_message_id": "m", "route_target": "P", "route_error": "E",
+                                    "route_ask_count": 1, "google_task_id": "g", "google_synced": {"title": "x"}})
+        out = tasks_for_context(s, "T-101 fix", "conversation")
+        task = out["T-101"]
+        self.assertIsInstance(task, dict)
+        for key in task:
+            self.assertFalse(key.startswith("route_"))
+            self.assertNotIn(key, ("google_task_id", "google_synced"))
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ def build_settings(config):
     s['owner_name']=c.get('owner_name') or s['owner_name']
     s['tasklist_id']=c.get('tasklist_id')
     s['people']=c.get('people') or {}
+    s['route_space_exclude']=c.get('route_space_exclude') or {}
     s['timezone']=os.environ.get('ASSISTANT_TIMEZONE',c.get('timezone') or s['timezone'])
     s['recap_hours']=os.environ.get('RECAP_HOURS',c.get('recap_hours') or s['recap_hours'])
     validate_settings(s)
@@ -90,7 +91,13 @@ def is_model_error(error):
     return False
 
 def _telemetry(values):
-    MODEL_TELEMETRY.clear(); MODEL_TELEMETRY.update(values); return values
+    MODEL_TELEMETRY.clear(); MODEL_TELEMETRY.update(values)
+    # Surface over-generation (a reasoning model that stalls); code/numbers only.
+    reasoning=MODEL_TELEMETRY.get('reasoning_tokens')
+    if isinstance(reasoning,int) and reasoning>2000:
+        print(json.dumps({'status':'MODEL_REASONING_SPIKE','reasoning_tokens':reasoning,
+            'context_tokens':MODEL_TELEMETRY.get('context_tokens'),'seq':MODEL_TELEMETRY.get('seq')}),flush=True)
+    return values
 
 def deepseek_complete(system,user,base=None,model=None,key=None,max_tokens=None):
     """One DeepSeek Chat Completions call, returning the parsed structured result."""
@@ -292,7 +299,7 @@ def tasks_for_context(state,user_text,kind,owner=None,evidence_ids=None):
         full |= set(evidence_ids or [])
     out={}
     for tid,t in tasks.items():
-        if tid in full: out[tid]={k:v for k,v in t.items() if k not in ('google_task_id','google_synced','tasks_sync_error')}
+        if tid in full: out[tid]={k:v for k,v in t.items() if k not in ('google_task_id','google_synced','tasks_sync_error') and not k.startswith('route_')}
         else: out[tid]=(f"{tid} — {t.get('title')} — owner {t.get('owner')} — due {t.get('deadline')} — {t.get('status')}")
     return out
 
@@ -604,8 +611,10 @@ class Runtime:
     @property
     def people(self): return (self.settings or {}).get('people') or {}
     def space_catalog(self):
-        spaces=list(pages(self.user,CHAT+'spaces','spaces',{'pageSize':1000}))
-        return routing.build_catalog(spaces,exclude_ids=[self.space])
+        # Bot identity: only spaces the assistant itself can post to.
+        spaces=list(pages(self.bot,CHAT+'spaces','spaces',{'pageSize':1000}))
+        exclude=(self.settings or {}).get('route_space_exclude') or {}
+        return routing.build_catalog(spaces,exclude_ids=[self.space],exclude=exclude)
     def member_user_id(self,space_id,person):
         try:
             members=list(pages(self.user,CHAT+space_id+'/members','memberships',{'pageSize':1000}))
@@ -641,7 +650,7 @@ class Runtime:
         add_outbox(state,self.space,'route-notice:'+task['id']+':'+str(task.get('route_notice_count',0)),text)
         task['route_notice_count']=task.get('route_notice_count',0)+1
     def deliver_route(self,state,task,person,space_id):
-        """Post the pill task message in the chosen space; never silent on failure."""
+        """Post the pill task message in the chosen space; never silent, never raises."""
         user_id=self.member_user_id(space_id,person)
         if not user_id:
             task['route_status']='unresolved_member'; task['route_space_id']=space_id
@@ -651,7 +660,14 @@ class Runtime:
                               +"). Reassign the task or pick another group.")
             return False
         message_id='client-cw-route-'+digest(task['id'])[:40]
-        receipt=self.post_to_space(space_id,routing.delivery_text(user_id,task),message_id,'route:'+task['id'])
+        try:
+            receipt=self.post_to_space(space_id,routing.delivery_text(user_id,task),message_id,'route:'+task['id'])
+        except Exception as error:
+            code=safe_code(error)
+            task['route_status']='error'; task['route_space_id']=space_id; task['route_error']=code
+            self.notify_owner(state,task,"I couldn't post to that space ("+task['id']
+                              +") — is the bot a member? ("+code+")")
+            return False
         task['route_space_id']=space_id; task['route_message_id']=receipt
         task['route_status']='delivered'; task['route_delivered']=now(); task.pop('route_error',None)
         return True
@@ -681,11 +697,26 @@ class Runtime:
         task['route_status']='awaiting'; task['route_candidates']=entries[:3]
         task['route_ask_count']=task.get('route_ask_count',0)
         self.ask_route_space(state,task,task['route_candidates'])
+    def plausible_answer(self,text,catalog):
+        """Only treat a message as a group answer when it plausibly is one."""
+        normalized=routing.normalize(text)
+        if not normalized: return False
+        if normalized.isdigit(): return True
+        if len(normalized.split())<=8: return True
+        for entry in catalog or []:
+            name=routing.normalize(entry['name'])
+            if name and name in normalized: return True
+        return False
     def apply_route_reply(self,state,text):
-        """Resolve the owner's group answer against the full catalog, then deliver."""
+        """Resolve the owner's group answer against the full catalog, then deliver.
+
+        A non-matching message is left alone (no re-ask), so the create message that
+        just asked the question cannot produce a second ask.
+        """
         awaiting=[t for t in state['tasks'].values() if t.get('route_status')=='awaiting']
         if not awaiting or not text: return
         catalog=self.space_catalog()
+        if not self.plausible_answer(text,catalog): return
         for task in awaiting:
             result=routing.match_space(text,task.get('route_candidates') or [],catalog)
             if result['status']=='matched':
@@ -693,12 +724,10 @@ class Runtime:
                 if not resolved or resolved=='AMBIGUOUS': continue
                 _,person=resolved
                 self.deliver_route(state,task,person,result['space_id'])
-            else:
+            elif result['status']=='ambiguous':
                 task['route_ask_count']=task.get('route_ask_count',0)+1
-                if result['status']=='ambiguous':
-                    self.ask_route_space(state,task,result['matches'],reason='ambiguous')
-                else:
-                    self.ask_route_space(state,task,None,reason='notfound')
+                self.ask_route_space(state,task,result['matches'],reason='ambiguous')
+            # none/notfound: do nothing — never re-ask on an unmatched message.
     def route_pending(self,state):
         for task_id,task in list(state['tasks'].items()):
             if task.get('route_status') in ('delivered','awaiting'): continue
@@ -830,7 +859,10 @@ class Runtime:
             before_ids=set(state['tasks'])
             owner_name=(getattr(self,'settings',None) or {}).get('owner_name','the owner')
             state=apply_changes(state,changes,source,owner_name,getattr(self,'mirror',None),getattr(self,'route',None))
-            if getattr(self,'people',None): self.apply_route_reply(state,text)
+            if getattr(self,'people',None):
+                try: self.apply_route_reply(state,text)
+                except Exception as error:
+                    print(json.dumps({'status':'ROUTE_REPLY_ERROR','code':safe_code(error),'time':now()}),flush=True)
             reply=with_create_signals(state,before_ids,result['reply'])
             state['processed'][key]={'source':name,'time':now(),'changes':len(changes),
                 'clarification':result['clarification_required'],'message_create_time':message.get('createTime')}

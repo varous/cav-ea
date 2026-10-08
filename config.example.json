@@ -15,6 +15,7 @@
   "people": {
     "PERSON_A": {"email": "person.a@example.com", "display_name": "Person A", "aliases": ["A"]}
   },
+  "route_space_exclude": {"ids": [], "patterns": []},
   "model": {
     "provider": "deepseek",
     "base_url": "https://api.deepseek.com",

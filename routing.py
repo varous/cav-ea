@@ -50,18 +50,28 @@ def is_routable_space(space):
     return (space.get("spaceType") or "SPACE") in ("SPACE", "GROUP_CHAT")
 
 
-def build_catalog(spaces, exclude_ids=(), contexts=None):
-    """Keep spaces and group chats only; exclude DMs and the given ids."""
+# Test/demo spaces must never be routing candidates, even without config.
+DEFAULT_EXCLUDE_PATTERN = r"test|bot|demo"
+
+
+def build_catalog(spaces, exclude_ids=(), contexts=None, exclude=None):
+    """Keep spaces and group chats only; exclude DMs, the given ids, and test/demo spaces."""
     contexts = contexts or {}
-    excluded = {normalize(x) for x in (exclude_ids or ())}
+    exclude = exclude or {}
+    ids = {normalize(x) for x in (exclude_ids or ())}
+    ids |= {normalize(x) for x in (exclude.get("ids") or [])}
+    patterns = [re.compile(p, re.I)
+                for p in [DEFAULT_EXCLUDE_PATTERN] + [p for p in (exclude.get("patterns") or []) if p]]
     catalog = []
     for space in spaces or []:
         space_id = space.get("name") or space.get("space_id")
-        if not space_id or normalize(space_id) in excluded:
+        if not space_id or normalize(space_id) in ids:
             continue
         if not is_routable_space(space):
             continue
         name = (space.get("displayName") or "").strip()
+        if any(pattern.search(name) for pattern in patterns):
+            continue
         context = (contexts.get(space_id) or name or "").strip()
         catalog.append({"space_id": space_id, "name": name, "context": context[:280]})
     return catalog
